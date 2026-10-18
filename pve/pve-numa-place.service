@@ -1,0 +1,13 @@
+[Unit]
+Description=Placement NUMA des VM et conteneurs Proxmox
+# /etc/pve (pmxcfs) doit être monté ; on passe avant le démarrage auto des invités
+After=pve-cluster.service
+Requires=pve-cluster.service
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-numa-place apply --live
+
+[Install]
+WantedBy=multi-user.target

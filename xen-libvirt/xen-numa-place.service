@@ -1,0 +1,12 @@
+[Unit]
+Description=Placement NUMA des VM Xen (libvirt)
+After=libvirtd.service xencommons.service
+Requires=libvirtd.service
+Before=libvirt-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xen-numa-place apply --live
+
+[Install]
+WantedBy=multi-user.target

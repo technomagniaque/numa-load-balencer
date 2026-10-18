@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""xen-numa-place — placement NUMA automatique des VM Xen gérées par libvirt (libxl),
+dom0 Debian 13 : vCPU et mémoire sur le(s) même(s) nœud(s).
+
+  xen-numa-place plan [--rebalance] [--cores-only]
+  xen-numa-place apply [--live] [--rebalance] [--cores-only] [VM...]
+  xen-numa-place status
+
+Règles (calcul dans numa_core.py, topologie lue par numa_xen.py via « xl info -n ») :
+  - VM avec <hostdev> PCI, <interface type='hostdev'> ou réseau SR-IOV -> nœud de la carte
+  - VM sans passthrough -> nœud(s) le(s) moins chargé(s), puis conservé(s)
+  - VM plus grande qu'un nœud -> plusieurs nœuds CONTIGUS
+  - <np:place mode="manual"/>, ou cpuset posé à la main sans marque -> ignorée
+
+Application : <vcpu cpuset=…> (affinité dure) ; libxl en déduit l'affinité de nœud
+et y alloue la mémoire au démarrage suivant. La marque <np:place mode="auto"/> va
+dans <metadata>. --live épingle aussi les vCPU tout de suite (xl vcpu-pin).
+"""
+import argparse
+import os
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+
+def _import_libs():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (here, os.path.dirname(here), "/usr/local/lib/numa-place"):
+        if os.path.exists(os.path.join(d, "numa_core.py")):
+            sys.path.insert(0, d)
+            break
+
+
+_import_libs()
+import numa_core as core  # noqa: E402
+import numa_xen as xen  # noqa: E402
+
+URI = os.environ.get("XNP_URI", "xen:///system")
+SYSFS = os.environ.get("XNP_SYSFS", "/sys")
+NS = "urn:numa-place:1"
+ET.register_namespace("np", NS)
+MEM_UNITS = {"b": 1, "bytes": 1, "KiB": 2**10, "k": 2**10, "MiB": 2**20, "M": 2**20,
+             "GiB": 2**30, "G": 2**30, "TiB": 2**40, "T": 2**40}
+
+
+def log(msg: str) -> None:
+    print("xen-numa-place: " + msg, file=sys.stderr)
+
+
+def virsh(run: xen.Runner, *args: str) -> Optional[str]:
+    return run(["virsh", "-q", "-c", URI] + list(args))
+
+
+class Vm(NamedTuple):
+    name: str
+    xml: str                   # définition persistante (--inactive)
+    vcpus: int
+    mem_mb: int
+    pci: Tuple[str, ...]
+    cpuset: Tuple[int, ...]    # () si absent
+    mode: str                  # "auto" | "manual" | ""
+    running: bool
+
+
+# ---------------------------------------------------------------- lecture
+
+def _pci_addr(addr: ET.Element) -> str:
+    vals = [int(addr.get(k, "0"), 0) for k in ("domain", "bus", "slot", "function")]
+    return "{:04x}:{:02x}:{:02x}.{:x}".format(*vals)
+
+
+def _pf_addr(run: xen.Runner, network: str) -> Optional[str]:
+    """PF d'un réseau libvirt <forward mode='hostdev'> -> adresse PCI."""
+    text = virsh(run, "net-dumpxml", network)
+    if not text:
+        return None
+    pf = ET.fromstring(text).find("./forward[@mode='hostdev']/pf")
+    if pf is None or not pf.get("dev"):
+        return None
+    real = os.path.realpath(os.path.join(SYSFS, "class/net", pf.get("dev"), "device"))
+    return os.path.basename(real) if os.path.exists(real) else None
+
+
+def pci_of(root: ET.Element, run: xen.Runner) -> Tuple[str, ...]:
+    addrs = [_pci_addr(a) for a in root.findall("./devices/hostdev[@type='pci']/source/address")]
+    addrs += [_pci_addr(a) for a in root.findall("./devices/interface[@type='hostdev']/source/address")]
+    for src in root.findall("./devices/interface[@type='network']/source"):
+        pf = _pf_addr(run, src.get("network", ""))
+        if pf and pf not in addrs:
+            addrs.append(pf)
+    return tuple(addrs)
+
+
+def load_vm(run: xen.Runner, name: str) -> Vm:
+    text = virsh(run, "dumpxml", "--inactive", name) or "<domain/>"
+    root = ET.fromstring(text)
+    vcpu = root.find("vcpu")
+    mem = root.find("memory")
+    mem_bytes = int(mem.text) * MEM_UNITS.get(mem.get("unit", "KiB"), 2**10) if mem is not None else 0
+    mark = root.find("./metadata/{%s}place" % NS)
+    domid = (virsh(run, "domid", name) or "").strip()
+    return Vm(
+        name=name, xml=text,
+        vcpus=int(vcpu.text) if vcpu is not None else 1,
+        mem_mb=mem_bytes // 2**20,
+        pci=pci_of(root, run),
+        cpuset=core.parse_cpulist(vcpu.get("cpuset")) if vcpu is not None and vcpu.get("cpuset") else (),
+        mode=mark.get("mode", "") if mark is not None else "",
+        running=domid.isdigit(),
+    )
+
+
+def load_vms(run: xen.Runner = xen.run_cmd) -> List[Vm]:
+    names = (virsh(run, "list", "--all", "--name") or "").split()
+    return [load_vm(run, n) for n in names if n != "Domain-0"]
+
+
+# ---------------------------------------------------------------- placement
+
+def is_manual(vm: Vm) -> bool:
+    return vm.mode == "manual" or (bool(vm.cpuset) and vm.mode != "auto")
+
+
+def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> core.Request:
+    cards = tuple(pci_nodes[a] for a in vm.pci if a in pci_nodes)
+    current = core.nodes_of_cpus(vm.cpuset, nodes) if vm.cpuset else ()
+    return core.Request(vm.name, vm.vcpus, vm.mem_mb, cards, current, vm.mode == "auto", is_manual(vm))
+
+
+def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
+               cores_only: bool = False, rebalance: bool = False
+               ) -> List[Tuple[Vm, core.Placement]]:
+    placements = core.plan(nodes, [to_request(v, nodes, pci_nodes) for v in vms], cores_only, rebalance)
+    return [(vm, placements[vm.name]) for vm in sorted(vms, key=lambda v: v.name)]
+
+
+# ---------------------------------------------------------------- application
+
+def placed_xml(vm: Vm, p: core.Placement) -> str:
+    """Rend la définition avec le cpuset et la marque numa-place « auto »."""
+    root = ET.fromstring(vm.xml)
+    vcpu = root.find("vcpu")
+    if vcpu is None:
+        vcpu = ET.SubElement(root, "vcpu")
+        vcpu.text = str(vm.vcpus)
+    vcpu.set("cpuset", core.format_cpulist(p.cpus))
+    meta = root.find("metadata")
+    if meta is None:
+        meta = ET.SubElement(root, "metadata")
+    mark = meta.find("{%s}place" % NS)
+    if mark is None:
+        mark = ET.SubElement(meta, "{%s}place" % NS)
+    mark.set("mode", "auto")
+    return ET.tostring(root, encoding="unicode")
+
+
+def apply_one(vm: Vm, p: core.Placement, live: bool, run: xen.Runner = xen.run_cmd) -> bool:
+    if vm.cpuset != p.cpus or vm.mode != "auto":
+        fd, path = tempfile.mkstemp(suffix=".xml")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(placed_xml(vm, p))
+            if virsh(run, "define", path) is None:
+                return False
+        finally:
+            os.unlink(path)
+        log("{}: nœud(s) {} ({}) — mémoire placée au prochain démarrage".format(
+            vm.name, core.format_cpulist(p.node_ids), p.reason))
+    if live and vm.running:
+        return xen.pin_live(vm.name, p.cpus, run)
+    return True
+
+
+# ---------------------------------------------------------------- CLI
+
+def show_plan(pairs: List[Tuple[Vm, core.Placement]]) -> None:
+    for vm, p in pairs:
+        where = "nœud {:<5}".format(core.format_cpulist(p.node_ids)) if p.nodes else "-" * 10
+        print("{:<24} {:>3} vCPU {:>7} Mo  {}  {}".format(
+            vm.name[:24], vm.vcpus, vm.mem_mb, where, p.reason))
+
+
+def show_status(pairs: List[Tuple[Vm, core.Placement]], run: xen.Runner) -> None:
+    mem = xen.domain_memory(run)
+    for vm, _ in pairs:
+        domid = (virsh(run, "domid", vm.name) or "").strip()
+        if not domid.isdigit():
+            print("{:<24} arrêtée".format(vm.name[:24]))
+            continue
+        cpus = core.format_cpulist(vm.cpuset) if vm.cpuset else "tous"
+        print("{:<24} cpuset={} ram[{}]".format(
+            vm.name[:24], cpus, xen.format_memory(mem.get(int(domid), {}))))
+
+
+def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int:
+    ap = argparse.ArgumentParser(description="Placement NUMA des VM Xen (libvirt)")
+    ap.add_argument("cmd", choices=("plan", "apply", "status"), nargs="?", default="plan")
+    ap.add_argument("vms", nargs="*", help="noms des VM (défaut : toutes)")
+    ap.add_argument("--live", action="store_true", help="épingle aussi les vCPU des VM en marche")
+    ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les VM déjà placées")
+    ap.add_argument("--cores-only", action="store_true",
+                    help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    args = ap.parse_args(argv)
+
+    nodes, pci_nodes = xen.read_topology(run)
+    if len(nodes) < 2:
+        log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
+        return 0
+    pairs = build_plan(nodes, pci_nodes, load_vms(run), args.cores_only, args.rebalance)
+    selected = [(vm, p) for vm, p in pairs if not args.vms or vm.name in args.vms]
+    if args.cmd == "plan":
+        show_plan(selected)
+    elif args.cmd == "status":
+        show_status(selected, run)
+    else:
+        results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
+        return 0 if all(results) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

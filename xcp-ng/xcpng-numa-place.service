@@ -1,0 +1,11 @@
+[Unit]
+Description=Placement NUMA des VM XCP-ng
+After=xapi.service
+Requires=xapi.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xcpng-numa-place apply --live
+
+[Install]
+WantedBy=multi-user.target

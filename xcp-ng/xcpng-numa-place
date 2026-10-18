@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""xcpng-numa-place — placement NUMA automatique des VM XCP-ng (8.3) :
+vCPU et mémoire sur le(s) même(s) nœud(s), en tenant compte du passthrough PCI.
+
+  xcpng-numa-place plan [--rebalance] [--cores-only]
+  xcpng-numa-place apply [--live] [--rebalance] [--cores-only] [NOM|UUID...]
+  xcpng-numa-place status
+
+Règles (calcul dans numa_core.py, topologie lue par numa_xen.py via « xl info -n ») :
+  - VM avec other-config:pci -> nœud de la carte
+  - VM sans passthrough -> nœud(s) le(s) moins chargé(s), puis conservé(s)
+  - VM plus grande qu'un nœud -> plusieurs nœuds CONTIGUS
+  - tag « numa-manual », ou VCPUs-params:mask posé à la main sans tag « numa-auto » -> ignorée
+
+Application : VCPUs-params:mask (affinité dure). Xen en déduit l'affinité de nœud
+du domaine et y alloue sa mémoire au démarrage suivant. --live épingle aussi les
+vCPU tout de suite (xl vcpu-pin) ; la mémoire ne bouge qu'au redémarrage de la VM.
+Compatible Python 3.6 (dom0 XCP-ng 8.3).
+"""
+import argparse
+import os
+import sys
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+
+def _import_libs():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (here, os.path.dirname(here), "/usr/local/lib/numa-place"):
+        if os.path.exists(os.path.join(d, "numa_core.py")):
+            sys.path.insert(0, d)
+            break
+
+
+_import_libs()
+import numa_core as core  # noqa: E402
+import numa_xen as xen  # noqa: E402
+
+TAG_AUTO = "numa-auto"
+TAG_MANUAL = "numa-manual"
+INVENTORY = os.environ.get("XNP_INVENTORY", "/etc/xensource-inventory")
+
+
+def log(msg: str) -> None:
+    print("xcpng-numa-place: " + msg, file=sys.stderr)
+
+
+class Vm(NamedTuple):
+    uuid: str
+    name: str
+    vcpus: int
+    mem_mb: int
+    pci: Tuple[str, ...]
+    tags: Tuple[str, ...]
+    mask: Tuple[int, ...]       # VCPUs-params:mask, () si absent
+    domid: Optional[int]        # None si arrêtée
+
+
+# ---------------------------------------------------------------- lecture xe
+
+def xe_get(run: xen.Runner, uuid: str, param: str) -> str:
+    return (run(["xe", "vm-param-get", "uuid=" + uuid, "param-name=" + param]) or "").strip()
+
+
+def xe_map(run: xen.Runner, uuid: str, param: str) -> Dict[str, str]:
+    """Lit une map entière (« k1: v1; k2: v2 ») : une clé absente n'est pas une erreur."""
+    out = {}  # type: Dict[str, str]
+    for item in xe_get(run, uuid, param).split("; "):
+        key, sep, val = item.partition(": ")
+        if sep:
+            out[key.strip()] = val.strip()
+    return out
+
+
+def parse_pci(value: str) -> Tuple[str, ...]:
+    """other-config:pci = « 0/0000:43:00.0,0/0000:44:00.0 » -> adresses."""
+    addrs = []
+    for item in filter(None, (v.strip() for v in value.split(","))):
+        addrs.append(item.split("/", 1)[-1].lower())
+    return tuple(addrs)
+
+
+def parse_tags(value: str) -> Tuple[str, ...]:
+    return tuple(t.strip() for t in value.split(";") if t.strip())
+
+
+def this_host_uuid() -> str:
+    try:
+        with open(INVENTORY) as fh:
+            for line in fh:
+                if line.startswith("INSTALLATION_UUID="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+def _on_this_host(run: xen.Runner, uuid: str, host: str, single_host: bool) -> bool:
+    if single_host:
+        return True
+    return host in (xe_get(run, uuid, "resident-on"), xe_get(run, uuid, "affinity"))
+
+
+def load_vm(run: xen.Runner, uuid: str) -> Vm:
+    mask = xe_map(run, uuid, "VCPUs-params").get("mask", "")
+    domid = xe_get(run, uuid, "dom-id")
+    return Vm(
+        uuid=uuid,
+        name=xe_get(run, uuid, "name-label"),
+        vcpus=int(xe_get(run, uuid, "VCPUs-max") or 1),
+        mem_mb=int(xe_get(run, uuid, "memory-static-max") or 0) // 2**20,
+        pci=parse_pci(xe_map(run, uuid, "other-config").get("pci", "")),
+        tags=parse_tags(xe_get(run, uuid, "tags")),
+        mask=core.parse_cpulist(mask) if mask else (),
+        domid=int(domid) if domid.isdigit() and int(domid) > 0 else None,
+    )
+
+
+def load_vms(run: xen.Runner = xen.run_cmd) -> List[Vm]:
+    uuids = (run(["xe", "vm-list", "is-control-domain=false", "is-a-snapshot=false",
+                  "is-a-template=false", "--minimal"]) or "").strip()
+    hosts = [h for h in (run(["xe", "host-list", "--minimal"]) or "").strip().split(",") if h]
+    host = this_host_uuid()
+    return [load_vm(run, u) for u in filter(None, uuids.split(","))
+            if _on_this_host(run, u, host, len(hosts) <= 1)]
+
+
+# ---------------------------------------------------------------- placement
+
+def is_auto(vm: Vm) -> bool:
+    return TAG_AUTO in vm.tags
+
+
+def is_manual(vm: Vm) -> bool:
+    return TAG_MANUAL in vm.tags or (bool(vm.mask) and not is_auto(vm))
+
+
+def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> core.Request:
+    cards = tuple(pci_nodes[a] for a in vm.pci if a in pci_nodes)
+    current = core.nodes_of_cpus(vm.mask, nodes) if vm.mask else ()
+    return core.Request(vm.uuid, vm.vcpus, vm.mem_mb, cards, current, is_auto(vm), is_manual(vm))
+
+
+def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
+               cores_only: bool = False, rebalance: bool = False
+               ) -> List[Tuple[Vm, core.Placement]]:
+    reqs = [to_request(vm, nodes, pci_nodes) for vm in vms]
+    placements = core.plan(nodes, reqs, cores_only, rebalance)
+    return [(vm, placements[vm.uuid]) for vm in sorted(vms, key=lambda v: v.name)]
+
+
+# ---------------------------------------------------------------- application
+
+def apply_one(vm: Vm, p: core.Placement, live: bool, run: xen.Runner = xen.run_cmd) -> bool:
+    ok = True
+    if vm.mask != p.cpus:
+        mask = ",".join(str(c) for c in p.cpus)
+        ok = run(["xe", "vm-param-set", "uuid=" + vm.uuid, "VCPUs-params:mask=" + mask]) is not None
+        if ok:
+            log("{}: nœud(s) {} ({}) — mémoire placée au prochain démarrage".format(
+                vm.name, core.format_cpulist(p.node_ids), p.reason))
+    if ok and not is_auto(vm):
+        ok = run(["xe", "vm-param-add", "uuid=" + vm.uuid, "param-name=tags",
+                  "param-key=" + TAG_AUTO]) is not None
+    if ok and live and vm.domid is not None:
+        ok = xen.pin_live(str(vm.domid), p.cpus, run)
+    return ok
+
+
+# ---------------------------------------------------------------- CLI
+
+def show_plan(pairs: List[Tuple[Vm, core.Placement]]) -> None:
+    for vm, p in pairs:
+        where = "nœud {:<5}".format(core.format_cpulist(p.node_ids)) if p.nodes else "-" * 10
+        print("{:<24} {:>3} vCPU {:>7} Mo  {}  {}".format(
+            vm.name[:24], vm.vcpus, vm.mem_mb, where, p.reason))
+
+
+def show_status(pairs: List[Tuple[Vm, core.Placement]], run: xen.Runner) -> None:
+    mem = xen.domain_memory(run)
+    for vm, _ in pairs:
+        if vm.domid is None:
+            state = "arrêtée"
+        else:
+            mask = core.format_cpulist(vm.mask) if vm.mask else "tous"
+            state = "mask={} ram[{}]".format(mask, xen.format_memory(mem.get(vm.domid, {})))
+        print("{:<24} {}".format(vm.name[:24], state))
+
+
+def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int:
+    ap = argparse.ArgumentParser(description="Placement NUMA des VM XCP-ng")
+    ap.add_argument("cmd", choices=("plan", "apply", "status"), nargs="?", default="plan")
+    ap.add_argument("vms", nargs="*", help="noms ou UUID (défaut : toutes)")
+    ap.add_argument("--live", action="store_true", help="épingle aussi les vCPU des VM en marche")
+    ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les VM déjà placées")
+    ap.add_argument("--cores-only", action="store_true",
+                    help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    args = ap.parse_args(argv)
+
+    nodes, pci_nodes = xen.read_topology(run)
+    if len(nodes) < 2:
+        log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
+        return 0
+    pairs = build_plan(nodes, pci_nodes, load_vms(run), args.cores_only, args.rebalance)
+    selected = [(vm, p) for vm, p in pairs
+                if not args.vms or vm.name in args.vms or vm.uuid in args.vms]
+    if args.cmd == "plan":
+        show_plan(selected)
+    elif args.cmd == "status":
+        show_status(selected, run)
+    else:
+        results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
+        return 0 if all(results) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

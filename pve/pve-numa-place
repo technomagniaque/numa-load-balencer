@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""pve-numa-place — placement NUMA automatique des VM KVM et conteneurs LXC
+sur Proxmox VE : threads ET mémoire sur le(s) même(s) nœud(s).
+
+  pve-numa-place plan [--rebalance] [--cores-only]
+  pve-numa-place apply [--live] [--rebalance] [--cores-only] [VMID...]
+  pve-numa-place status
+
+Règles (calcul dans numa_core.py) :
+  - invité avec passthrough (hostpci, /dev/dri, /dev/nvidiaN) -> nœud de la carte
+  - invité sans passthrough -> nœud(s) le(s) moins chargé(s), puis conservé(s)
+  - invité plus grand qu'un nœud -> plusieurs nœuds CONTIGUS ; une VM KVM voit
+    alors autant de nœuds NUMA que l'hôte lui en donne (numa0, numa1…)
+  - --cores-only : un nœud « contient » ses cœurs physiques, pas ses threads SMT
+  - tag « numa-manual » ou pinning posé à la main sans tag « numa-auto » -> ignoré
+
+KVM : affinity (tous les threads QEMU) + numaN hostnodes=… policy=bind
+LXC : lxc.cgroup2.cpuset.cpus / lxc.cgroup2.cpuset.mems
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from dataclasses import dataclass
+
+
+def _import_core():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (here, os.path.dirname(here), "/usr/local/lib/numa-place"):
+        if os.path.exists(os.path.join(d, "numa_core.py")):
+            sys.path.insert(0, d)
+            break
+    import numa_core  # noqa: E402
+    return numa_core
+
+
+core = _import_core()
+Node, Request, Placement = core.Node, core.Request, core.Placement
+parse_cpulist, format_cpulist = core.parse_cpulist, core.format_cpulist
+
+SYSFS = os.environ.get("PNP_SYSFS", "/sys")
+PROC = os.environ.get("PNP_PROC", "/proc")
+PVE = os.environ.get("PNP_PVE_DIR", "/etc/pve")
+RUN = os.environ.get("PNP_RUN_DIR", "/var/run")
+NODENAME = os.environ.get("PNP_NODENAME") or socket.gethostname().split(".")[0]
+
+TAG_AUTO = "numa-auto"
+TAG_MANUAL = "numa-manual"
+LXC_CPUS = "lxc.cgroup2.cpuset.cpus"
+LXC_MEMS = "lxc.cgroup2.cpuset.mems"
+
+
+def log(msg: str) -> None:
+    print(f"pve-numa-place: {msg}", file=sys.stderr)
+
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------- topologie
+
+def _physical_cores(cpus: tuple[int, ...]) -> int:
+    cores = set()
+    for c in cpus:
+        topo = f"{SYSFS}/devices/system/cpu/cpu{c}/topology"
+        cores.add((_read(f"{topo}/physical_package_id"), _read(f"{topo}/core_id") or str(c)))
+    return len(cores)
+
+
+def read_topology() -> list[Node]:
+    nodes = []
+    for d in sorted(glob.glob(f"{SYSFS}/devices/system/node/node[0-9]*"),
+                    key=lambda p: int(p.rsplit("node", 1)[1])):
+        nid = int(d.rsplit("node", 1)[1])
+        cpus = parse_cpulist(_read(f"{d}/cpulist") or "")
+        m = re.search(r"MemTotal:\s+(\d+)\s*kB", _read(f"{d}/meminfo") or "")
+        if cpus and m:
+            nodes.append(Node(nid, cpus, _physical_cores(cpus), int(m.group(1)) // 1024))
+    return nodes
+
+
+# ---------------------------------------------------------------- PCI
+
+def normalize_pci(addr: str) -> str:
+    addr = addr.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{2}:[0-9a-f]{2}(\.[0-7])?", addr):
+        addr = "0000:" + addr
+    if "." not in addr:
+        addr += ".0"
+    return addr
+
+
+def pci_node(addr: str) -> int | None:
+    raw = _read(f"{SYSFS}/bus/pci/devices/{addr}/numa_node")
+    if raw is None or int(raw) < 0:
+        return None
+    return int(raw)
+
+
+def resolve_mapping(name: str) -> list[str]:
+    """Résout un mapping de ressource PCI (/etc/pve/mapping/pci.cfg) pour ce nœud."""
+    current, paths = None, []
+    for line in (_read(f"{PVE}/mapping/pci.cfg") or "").splitlines():
+        if line and not line[0].isspace():
+            current = line.strip()
+            continue
+        fields = dict(kv.split("=", 1) for kv in line.strip().removeprefix("map").strip().split(",")
+                      if "=" in kv)
+        if current == name and fields.get("node") == NODENAME and "path" in fields:
+            paths.extend(fields["path"].split(";"))
+    return paths
+
+
+def hostpci_addrs(value: str) -> list[str]:
+    for field in value.split(","):
+        key, sep, val = field.partition("=")
+        if not sep:
+            return [normalize_pci(a) for a in key.split(";")]
+        if key == "host":
+            return [normalize_pci(a) for a in val.split(";")]
+        if key == "mapping":
+            return [normalize_pci(a) for a in resolve_mapping(val)]
+    return []
+
+
+def devnode_pci(dev: str) -> str | None:
+    """/dev/dri/renderD128 ou /dev/nvidia0 -> adresse PCI de la carte."""
+    m = re.fullmatch(r"/dev/dri/((?:renderD|card)\d+)", dev)
+    if m:
+        real = os.path.realpath(f"{SYSFS}/class/drm/{m.group(1)}/device")
+        return os.path.basename(real) if os.path.exists(real) else None
+    m = re.fullmatch(r"/dev/nvidia(\d+)", dev)
+    if m:
+        for info in glob.glob(f"{PROC}/driver/nvidia/gpus/*/information"):
+            if re.search(rf"Device Minor:\s*{m.group(1)}\b", _read(info) or ""):
+                return os.path.basename(os.path.dirname(info)).lower()
+    return None
+
+
+# ---------------------------------------------------------------- invités
+
+@dataclass(frozen=True)
+class Guest:
+    kind: str                      # "qemu" | "lxc"
+    vmid: int
+    path: str
+    main: tuple[str, ...]          # section principale du .conf
+    rest: tuple[str, ...]          # snapshots / pending
+    conf: dict                     # clé -> [valeurs]
+    vcpus: int
+    mem_mb: int
+    pci: tuple[str, ...]
+    tags: tuple[str, ...]
+
+    def get(self, key: str) -> str | None:
+        vals = self.conf.get(key)
+        return vals[0] if vals else None
+
+
+def split_conf(text: str) -> tuple[list[str], list[str]]:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            return lines[:i], lines[i:]
+    return lines, []
+
+
+def parse_main(lines: list[str]) -> dict:
+    conf: dict = {}
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition(":")
+        if sep:
+            conf.setdefault(key.strip(), []).append(val.strip())
+    return conf
+
+
+def guest_pci(kind: str, conf: dict) -> list[str]:
+    addrs: list[str] = []
+    for key, vals in conf.items():
+        if kind == "qemu" and re.fullmatch(r"hostpci\d+", key):
+            addrs.extend(hostpci_addrs(vals[0]))
+        if kind == "lxc" and (re.fullmatch(r"dev\d+", key) or key == "lxc.mount.entry"):
+            for val in vals:
+                for dev in re.findall(r"/dev/(?:dri/(?:renderD|card)\d+|nvidia\d+)\b", val):
+                    addr = devnode_pci(dev)
+                    if addr and addr not in addrs:
+                        addrs.append(addr)
+    return addrs
+
+
+def load_guest(kind: str, path: str) -> Guest:
+    main, rest = split_conf(_read(path) or "")
+    conf = parse_main(main)
+    get = lambda k, d: (conf.get(k) or [d])[0]  # noqa: E731
+    mem = int(re.search(r"(\d+)", get("memory", "512")).group(1))
+    if kind == "qemu":
+        vcpus = int(get("sockets", "1")) * int(get("cores", "1"))
+    else:
+        vcpus = int(get("cores", "1"))
+    tags = tuple(t for t in re.split(r"[;, ]+", get("tags", "")) if t)
+    return Guest(kind, int(os.path.basename(path).split(".")[0]), path,
+                 tuple(main), tuple(rest), conf, vcpus, mem,
+                 tuple(guest_pci(kind, conf)), tags)
+
+
+def load_guests() -> list[Guest]:
+    guests = []
+    for kind, sub in (("qemu", "qemu-server"), ("lxc", "lxc")):
+        for path in sorted(glob.glob(f"{PVE}/{sub}/*.conf")):
+            guests.append(load_guest(kind, path))
+    return guests
+
+
+def is_auto(g: Guest) -> bool:
+    return TAG_AUTO in g.tags
+
+
+def _numa_keys(g: Guest) -> list[str]:
+    return sorted((k for k in g.conf if re.fullmatch(r"numa\d+", k)), key=lambda k: int(k[4:]))
+
+
+def has_pin(g: Guest) -> bool:
+    if g.kind == "qemu":
+        return bool(g.get("affinity")) or any("hostnodes=" in g.get(k) for k in _numa_keys(g))
+    return LXC_CPUS in g.conf or LXC_MEMS in g.conf
+
+
+def is_manual(g: Guest) -> bool:
+    return TAG_MANUAL in g.tags or (has_pin(g) and not is_auto(g))
+
+
+def current_nodes(g: Guest, nodes: list[Node]) -> tuple[int, ...]:
+    if g.kind == "qemu":
+        hosts: set[int] = set()
+        for k in _numa_keys(g):
+            m = re.search(r"hostnodes=([0-9;\-]+)", g.get(k))
+            if m:
+                hosts.update(parse_cpulist(m.group(1).replace(";", ",")))
+        if hosts:
+            return tuple(sorted(hosts))
+        cpus = g.get("affinity")
+    else:
+        if g.get(LXC_MEMS):
+            return parse_cpulist(g.get(LXC_MEMS))
+        cpus = g.get(LXC_CPUS)
+    return core.nodes_of_cpus(parse_cpulist(cpus), nodes) if cpus else ()
+
+
+def to_request(g: Guest, nodes: list[Node]) -> Request:
+    pci_nodes = tuple(n for n in (pci_node(a) for a in g.pci) if n is not None)
+    return Request(str(g.vmid), g.vcpus, g.mem_mb, pci_nodes,
+                   current_nodes(g, nodes), is_auto(g), is_manual(g))
+
+
+# ---------------------------------------------------------------- application
+
+def _tags_with_auto(g: Guest) -> str:
+    return ";".join(g.tags + (() if is_auto(g) else (TAG_AUTO,)))
+
+
+def split_guest(vcpus: int, mem_mb: int, hosts: tuple[int, ...]) -> list[tuple[str, str, int]]:
+    """Découpe l'invité en nœuds NUMA virtuels alignés sur les nœuds hôtes.
+
+    Rend [(cpus invité, hostnodes, mémoire Mo), …] ; la somme des mémoires vaut mem_mb.
+    """
+    count = min(len(hosts), vcpus)
+    host_groups = _split(list(hosts), count)
+    cpu_groups = _split(list(range(vcpus)), count)
+    per_host = mem_mb // len(hosts)
+    out = []
+    for i, (hg, cg) in enumerate(zip(host_groups, cpu_groups)):
+        mem = per_host * len(hg) + (mem_mb - per_host * len(hosts) if i == count - 1 else 0)
+        cpus = str(cg[0]) if len(cg) == 1 else f"{cg[0]}-{cg[-1]}"
+        out.append((cpus, format_cpulist(hg).replace(",", ";"), mem))
+    return out
+
+
+def _split(items: list, parts: int) -> list[list]:
+    base, extra = divmod(len(items), parts)
+    out, start = [], 0
+    for i in range(parts):
+        size = base + (1 if i < extra else 0)
+        out.append(items[start:start + size])
+        start += size
+    return out
+
+
+def qemu_changes(p: Placement, g: Guest) -> dict[str, str]:
+    want = {"affinity": format_cpulist(p.cpus), "tags": _tags_with_auto(g)}
+    if "memory" not in (g.get("hotplug") or ""):
+        want["numa"] = "1"
+        for i, (cpus, hosts, mem) in enumerate(split_guest(g.vcpus, g.mem_mb, p.node_ids)):
+            want[f"numa{i}"] = f"cpus={cpus},hostnodes={hosts},memory={mem},policy={p.policy}"
+    current = {k: g.get(k) for k in want}
+    current["tags"] = ";".join(g.tags)
+    changes = {k: v for k, v in want.items() if current[k] != v}
+    stale = [k for k in _numa_keys(g) if k not in want]
+    if stale:
+        changes["delete"] = ",".join(stale)
+    return changes
+
+
+def lxc_new_conf(p: Placement, g: Guest) -> str | None:
+    drop = (f"{LXC_CPUS}:", f"{LXC_MEMS}:", "tags:")
+    main = [line for line in g.main if not line.startswith(drop)]
+    while main and not main[-1].strip():
+        main.pop()
+    main += [f"tags: {_tags_with_auto(g)}", f"{LXC_CPUS}: {format_cpulist(p.cpus)}"]
+    if p.policy == "bind":
+        main.append(f"{LXC_MEMS}: {format_cpulist(p.node_ids)}")
+    text = "\n".join(main + ([""] + list(g.rest) if g.rest else [])) + "\n"
+    return None if text == (_read(g.path) or "") else text
+
+
+def _run(cmd: list[str]) -> bool:
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        log(f"échec {' '.join(cmd)} : {res.stderr.strip()}")
+    return res.returncode == 0
+
+
+def _qemu_pid(vmid: int) -> str | None:
+    pid = (_read(f"{RUN}/qemu-server/{vmid}.pid") or "").strip()
+    return pid if pid and os.path.isdir(f"{PROC}/{pid}") else None
+
+
+def apply_live(p: Placement, g: Guest, run=_run) -> None:
+    cpus, mems = format_cpulist(p.cpus), format_cpulist(p.node_ids)
+    if g.kind == "qemu":
+        pid = _qemu_pid(g.vmid)
+        if not pid:
+            return
+        run(["taskset", "-a", "-cp", cpus, pid])
+        if g.pci:  # VFIO verrouille la RAM de l'invité : pas de migration à chaud
+            log(f"{g.vmid}: RAM figée par VFIO, déplacée au prochain démarrage")
+        elif p.policy == "bind" and shutil.which("migratepages"):
+            run(["migratepages", pid, "all", mems])
+        return
+    cg = f"{SYSFS}/fs/cgroup/lxc/{g.vmid}"
+    if os.path.isdir(cg):
+        _write_cg(f"{cg}/cpuset.cpus", cpus)
+        if p.policy == "bind":
+            _write_cg(f"{cg}/cpuset.mems", mems)  # cgroup v2 migre les pages
+
+
+def _write_cg(path: str, value: str) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(value)
+    except OSError as exc:
+        log(f"échec écriture {path} : {exc}")
+
+
+def _write_conf(p: Placement, g: Guest, run) -> bool | None:
+    """Écrit la config persistante. Rend True si modifiée, None si échec."""
+    if g.kind == "qemu":
+        changes = qemu_changes(p, g)
+        if not changes:
+            return False
+        args = [a for k, v in changes.items() for a in (f"--{k}", v)]
+        return True if run(["qm", "set", str(g.vmid), *args]) else None
+    text = lxc_new_conf(p, g)
+    if text is None:
+        return False
+    with open(g.path, "w", encoding="utf-8") as fh:  # pmxcfs : écriture directe
+        fh.write(text)
+    return True
+
+
+def apply_one(p: Placement, g: Guest, live: bool, run=_run) -> bool:
+    if g.get("lock"):
+        log(f"{g.vmid}: verrouillé ({g.get('lock')}), ignoré")
+        return False
+    changed = _write_conf(p, g, run)
+    if changed is None:
+        return False
+    if changed:
+        log(f"{g.kind} {g.vmid}: nœud(s) {format_cpulist(p.node_ids)} ({p.reason}, {p.policy})")
+    if live:
+        apply_live(p, g, run)
+    return True
+
+
+# ---------------------------------------------------------------- état réel
+
+def _numa_maps_mb(pid: str) -> dict[int, int]:
+    per_node: dict[int, int] = {}
+    for line in (_read(f"{PROC}/{pid}/numa_maps") or "").splitlines():
+        m = re.search(r"kernelpagesize_kB=(\d+)", line)
+        page_kb = int(m.group(1)) if m else 4
+        for nid, pages in re.findall(r"\bN(\d+)=(\d+)", line):
+            per_node[int(nid)] = per_node.get(int(nid), 0) + int(pages) * page_kb
+    return {k: v // 1024 for k, v in per_node.items()}
+
+
+def _lxc_numa_mb(vmid: int) -> dict[int, int]:
+    per_node: dict[int, int] = {}
+    for line in (_read(f"{SYSFS}/fs/cgroup/lxc/{vmid}/memory.numa_stat") or "").splitlines():
+        if line.split(" ", 1)[0] in ("anon", "file"):
+            for nid, size in re.findall(r"N(\d+)=(\d+)", line):
+                per_node[int(nid)] = per_node.get(int(nid), 0) + int(size)
+    return {k: v // 2**20 for k, v in per_node.items()}
+
+
+def actual_state(g: Guest) -> str:
+    if g.kind == "qemu":
+        pid = _qemu_pid(g.vmid)
+        if not pid:
+            return "arrêtée"
+        m = re.search(r"Cpus_allowed_list:\s*(\S+)", _read(f"{PROC}/{pid}/status") or "")
+        cpus, mem = (m.group(1) if m else "?"), _numa_maps_mb(pid)
+    else:
+        cg = f"{SYSFS}/fs/cgroup/lxc/{g.vmid}"
+        if not os.path.isdir(cg):
+            return "arrêté"
+        cpus, mem = (_read(f"{cg}/cpuset.cpus.effective") or "?").strip(), _lxc_numa_mb(g.vmid)
+    ram = " ".join(f"N{k}={v}M" for k, v in sorted(mem.items())) or "?"
+    return f"cpus={cpus} ram[{ram}]"
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
+               rebalance: bool = False) -> list[tuple[Guest, Placement]]:
+    placements = core.plan(nodes, [to_request(g, nodes) for g in guests], cores_only, rebalance)
+    return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
+
+
+def show_plan(pairs: list[tuple[Guest, Placement]]) -> None:
+    for g, p in pairs:
+        where = f"nœud {format_cpulist(p.node_ids):<5} {p.policy:<9}" if p.nodes else "-" * 21
+        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {g.mem_mb:>7} Mo  {where}  {p.reason}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Placement NUMA des VM/CT Proxmox")
+    ap.add_argument("cmd", choices=("plan", "apply", "status"), nargs="?", default="plan")
+    ap.add_argument("vmids", nargs="*", type=int)
+    ap.add_argument("--live", action="store_true", help="applique aussi aux invités en marche")
+    ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les invités déjà placés")
+    ap.add_argument("--cores-only", action="store_true",
+                    help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    args = ap.parse_args(argv)
+
+    nodes = read_topology()
+    if len(nodes) < 2:
+        log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
+        return 0
+    # le plan porte toujours sur tous les invités, pour un équilibrage cohérent
+    pairs = build_plan(nodes, load_guests(), args.cores_only, args.rebalance)
+    selected = [(g, p) for g, p in pairs if not args.vmids or g.vmid in args.vmids]
+    if args.cmd == "plan":
+        show_plan(selected)
+        return 0
+    if args.cmd == "status":
+        for g, _ in selected:
+            print(f"{g.kind:<4} {g.vmid:>6}  {actual_state(g)}")
+        return 0
+    ok = all([apply_one(p, g, args.live) for g, p in selected if p.nodes])
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
