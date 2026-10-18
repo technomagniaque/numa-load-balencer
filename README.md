@@ -1,6 +1,8 @@
 # numa-place — placement NUMA automatique (Proxmox, XCP-ng, Xen + libvirt)
 
 Hôte cible : EPYC 7551P (4 nœuds de 8 cœurs / 16 threads), P40 et Chelsio T6225-CR en passthrough.
+Sur `xcp-ng-epyc` (XCP-ng 8.3, Xen 4.17, Python 3.6.8), le SMT est désactivé : 8 pCPU par nœud,
+la P40 (`0000:61:00.0`) est sur le nœud 3. Sortie réelle de `xl info -n` : `tests/fixtures/`.
 
 Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NUMA :
 

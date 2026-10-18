@@ -70,6 +70,16 @@ class NumaXenTest(unittest.TestCase):
     def test_domain_memory_from_debug_keys(self):
         self.assertEqual(xen.domain_memory(FakeXl())[5], {2: 16384, 3: 0})
 
+    def test_real_xcp_ng_epyc_output(self):
+        """Sortie réelle de xcp-ng-epyc (XCP-ng 8.3, Xen 4.17, 7551P, SMT désactivé)."""
+        text = (Path(__file__).parent / "fixtures/xl-info-n-xcp-ng-epyc.txt").read_text()
+        nodes, pci = xen.parse_xl_info(text)
+        self.assertEqual([(n.id, len(n.cpus), n.cores) for n in nodes], [(i, 8, 8) for i in range(4)])
+        self.assertEqual([n.mem_mb for n in nodes], [33536, 32768, 32768, 32767])
+        self.assertEqual(nodes[1].cpus, tuple(range(8, 16)))
+        self.assertEqual(pci["0000:61:00.0"], 3)  # Tesla P40
+        self.assertEqual(len(pci), 118)
+
     def test_old_domain_header_format(self):
         text = "Memory location of each domain:\n(XEN) Domain 7 (total: 256):\n(XEN)     Node 1: 256\n"
         self.assertEqual(xen.parse_domain_memory(text), {7: {1: 1}})
@@ -109,7 +119,7 @@ class FakeXe(FakeXl):
             vm["VCPUs-params"] = "mask: " + args["VCPUs-params:mask"]
             return ""
         if cmd[1] == "vm-param-add":
-            vm["tags"] = "; ".join(filter(None, [vm["tags"], args["param-key"]]))
+            vm["tags"] = ", ".join(filter(None, [vm["tags"], args["param-key"]]))
             return ""
         return None
 
@@ -138,6 +148,7 @@ class XcpngTest(unittest.TestCase):
         ia = self.xe.vms["u-ia"]
         self.assertEqual(ia["VCPUs-params"], "mask: " + ",".join(map(str, list(range(16, 24)) + list(range(48, 56)))))
         self.assertEqual(ia["tags"], "numa-auto")
+        self.assertEqual(self.m.parse_tags(", XOA, 2025.12"), ("XOA", "2025.12"))
         self.assertIn(["xl", "vcpu-pin", "5", "all", "16-23,48-55"], self.xe.calls)
         self.xe.calls.clear()
         for vm, p in self.plan().values():

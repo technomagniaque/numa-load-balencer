@@ -19,6 +19,7 @@ Compatible Python 3.6 (dom0 XCP-ng 8.3).
 """
 import argparse
 import os
+import re
 import sys
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -80,7 +81,8 @@ def parse_pci(value: str) -> Tuple[str, ...]:
 
 
 def parse_tags(value: str) -> Tuple[str, ...]:
-    return tuple(t.strip() for t in value.split(";") if t.strip())
+    """xe rend les tags séparés par des virgules (« , XOA, 2025.12 » sur XCP-ng 8.3)."""
+    return tuple(t.strip() for t in re.split(r"[,;]", value) if t.strip())
 
 
 def this_host_uuid() -> str:
