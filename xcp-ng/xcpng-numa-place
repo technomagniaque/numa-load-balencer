@@ -164,8 +164,14 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
     current = core.nodes_of_cpus(vm.mask, nodes) if vm.mask else ()
     usage = st.usage(state, vm.uuid) if state is not None else None
     cooling = state is not None and st.in_cooldown(state, vm.uuid, now)
+    home = st.home(state, vm.uuid, boot_id(vm)) if state is not None else ()
     return core.Request(vm.uuid, vm.vcpus, vm.guaranteed_mb, cards, current,
-                        is_auto(vm), is_manual(vm), vm.elastic, usage, cooling)
+                        is_auto(vm), is_manual(vm), vm.elastic, usage, cooling, home)
+
+
+def boot_id(vm: Vm) -> str:
+    """Change à chaque démarrage : la RAM est alors réallouée là où tourne la VM."""
+    return str(vm.domid) if vm.domid else ""
 
 
 def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:
@@ -258,8 +264,10 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
         show_status(selected, run)
     else:
         results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
-        moved = [vm.uuid for vm, p in selected if p.nodes and vm.mask and vm.mask != p.cpus]
-        st.save(STATE, st.mark_moved(state if state is not None else saved, moved, now))
+        moves = {vm.uuid: (before, p.node_ids) for vm, p in selected if p.nodes and vm.mask
+                 for before in [core.nodes_of_cpus(vm.mask, nodes)] if before != p.node_ids}
+        boots = {vm.uuid: boot_id(vm) for vm, _ in selected}
+        st.save(STATE, st.record_moves(state if state is not None else saved, moves, boots, now))
         return 0 if all(results) else 1
     return 0
 

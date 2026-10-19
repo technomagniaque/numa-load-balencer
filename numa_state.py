@@ -10,12 +10,12 @@ import os
 import sys
 import tempfile
 import time
-from typing import Callable, Dict, Iterable, Mapping, Optional
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 ALPHA = 0.5          # poids de la nouvelle mesure dans la moyenne lissée
 COOLDOWN_S = 600     # une VM déplacée ne rebouge pas avant 10 minutes
 
-State = Dict[str, Dict[str, float]]
+State = Dict[str, Dict[str, object]]
 
 
 def load(path: str) -> State:
@@ -65,6 +65,37 @@ def mark_moved(state: Mapping[str, Mapping[str, float]], keys: Iterable[str], no
     out = {k: dict(v) for k, v in state.items()}
     for key in keys:
         out[key] = dict(out.get(key, {}), moved=now)
+    return out
+
+
+def home(state: Mapping[str, Mapping[str, object]], key: str, boot: str = "") -> Tuple[int, ...]:
+    """Nœud(s) où se trouve la RAM d'une VM évacuée, () si inconnu.
+
+    Ignoré si la VM a redémarré depuis (identifiant de démarrage différent : domid
+    Xen, PID QEMU) : sa RAM a alors été réallouée là où elle tourne."""
+    entry = state.get(key, {})
+    nodes = entry.get("home")
+    if not nodes or (boot and entry.get("boot") not in (None, "", boot)):
+        return ()
+    return tuple(int(n) for n in nodes)
+
+
+def record_moves(state: Mapping[str, Mapping[str, object]],
+                 moves: Mapping[str, Tuple[Sequence[int], Sequence[int]]],
+                 boots: Mapping[str, str], now: float) -> State:
+    """Note chaque déplacement (avant, après) : date, et nœud d'origine de la RAM.
+
+    Le premier déplacement retient l'origine ; le retour sur l'origine l'efface."""
+    out = {k: dict(v) for k, v in state.items()}
+    for key, (before, after) in moves.items():
+        entry = dict(out.get(key, {}), moved=now)
+        origin = home(state, key, boots.get(key, ""))
+        if origin and tuple(sorted(after)) == origin:
+            entry.pop("home", None)
+            entry.pop("boot", None)
+        elif not origin:
+            entry.update(home=sorted(before), boot=boots.get(key, ""))
+        out[key] = entry
     return out
 
 

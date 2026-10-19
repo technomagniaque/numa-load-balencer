@@ -23,6 +23,20 @@ class StateTest(unittest.TestCase):
         self.assertFalse(st.in_cooldown(s, "b", now=1000.0))
         self.assertFalse(st.in_cooldown({"c": {"ema": 1.0}}, "c", now=5.0))  # jamais déplacée
 
+    def test_home_is_set_on_first_move_and_cleared_on_return(self):
+        s = st.record_moves({}, {"a": ((1,), (2,))}, {"a": "7"}, now=10.0)
+        self.assertEqual(st.home(s, "a", "7"), (1,))
+        s = st.record_moves(s, {"a": ((2,), (3,))}, {"a": "7"}, now=20.0)
+        self.assertEqual(st.home(s, "a", "7"), (1,))      # l'origine de la RAM ne change pas
+        s = st.record_moves(s, {"a": ((3,), (1,))}, {"a": "7"}, now=30.0)
+        self.assertEqual(st.home(s, "a", "7"), ())        # revenue : plus d'origine à retenir
+        self.assertEqual(s["a"]["moved"], 30.0)
+
+    def test_home_is_forgotten_after_reboot(self):
+        s = st.record_moves({}, {"a": ((1,), (2,))}, {"a": "7"}, now=10.0)
+        self.assertEqual(st.home(s, "a", "9"), ())        # domid différent : RAM réallouée
+        self.assertEqual(st.home(s, "a", ""), (1,))       # VM arrêtée : on garde l'information
+
     def test_measure_uses_cpu_time_delta(self):
         reads = iter([{"a": 10.0, "b": 5.0}, {"a": 30.0, "c": 1.0}])
         clock = iter([100.0, 110.0])

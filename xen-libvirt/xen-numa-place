@@ -72,6 +72,7 @@ class Vm(NamedTuple):
     mode: str                  # "auto" | "manual" | ""
     running: bool
     mem_min_mb: int = 0        # <currentMemory> (cible du ballooning) si < <memory>
+    domid: str = ""            # change à chaque démarrage (RAM réallouée)
 
     @property
     def guaranteed_mb(self) -> int:
@@ -144,6 +145,7 @@ def load_vm(run: xen.Runner, name: str) -> Vm:
         mode=mark.get("mode", "") if mark is not None else "",
         running=domid.isdigit(),
         mem_min_mb=cur_bytes // 2**20 if 0 < cur_bytes < mem_bytes else 0,
+        domid=domid if domid.isdigit() else "",
     )
 
 
@@ -165,8 +167,9 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
     current = core.nodes_of_cpus(vm.cpuset, nodes) if vm.cpuset else ()
     usage = st.usage(state, vm.name) if state is not None else None
     cooling = state is not None and st.in_cooldown(state, vm.name, now)
+    home = st.home(state, vm.name, vm.domid) if state is not None else ()
     return core.Request(vm.name, vm.vcpus, vm.guaranteed_mb, cards, current,
-                        vm.mode == "auto", is_manual(vm), vm.elastic, usage, cooling)
+                        vm.mode == "auto", is_manual(vm), vm.elastic, usage, cooling, home)
 
 
 def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:
@@ -277,8 +280,10 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
         show_status(selected, run)
     else:
         results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
-        moved = [vm.name for vm, p in selected if p.nodes and vm.cpuset and vm.cpuset != p.cpus]
-        st.save(STATE, st.mark_moved(state if state is not None else saved, moved, now))
+        moves = {vm.name: (before, p.node_ids) for vm, p in selected if p.nodes and vm.cpuset
+                 for before in [core.nodes_of_cpus(vm.cpuset, nodes)] if before != p.node_ids}
+        boots = {vm.name: vm.domid for vm, _ in selected}
+        st.save(STATE, st.record_moves(state if state is not None else saved, moves, boots, now))
         return 0 if all(results) else 1
     return 0
 

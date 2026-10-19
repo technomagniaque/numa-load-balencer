@@ -15,6 +15,8 @@ Règles :
   - … sauf une petite VM dont les nœuds sont saturés par la charge CPU RÉELLE
     (ex. une grosse VM devenue active) : elle est évacuée vers les nœuds les moins
     chargés, si le gain dépasse MOVE_GAIN pCPU et qu'elle n'a pas bougé récemment ;
+  - quand la charge retombe (nœud d'origine sous RETURN_LOAD), une VM évacuée revient
+    sur le nœud où se trouve sa RAM (Xen ne déplace pas la mémoire à chaud) ;
   - une VM « chaude » (HOT_FRACTION de ses vCPU, au moins HOT_MIN pCPU) ne bouge pas ;
   - les invités épinglés à la main ne bougent pas mais comptent dans la charge.
 """
@@ -25,6 +27,7 @@ HOT_FRACTION = 0.5   # VM « chaude » : consomme au moins la moitié de ses vCP
 HOT_MIN = 2.0        # … et au moins 2 pCPU
 OVERLOAD = 0.85      # nœud saturé au-delà de 85 % de ses pCPU
 MOVE_GAIN = 1.0      # hystérésis : n'évacuer que si l'on gagne au moins 1 pCPU
+RETURN_LOAD = 0.60   # retour au nœud de sa RAM quand il redescend sous 60 % (< OVERLOAD)
 
 
 class Node(NamedTuple):
@@ -45,6 +48,7 @@ class Request(NamedTuple):
     elastic: bool = False        # ballooning actif : la RAM peut dépasser mem_mb
     usage: Optional[float] = None  # pCPU réellement consommés (lissés), None = inconnu
     cooldown: bool = False       # déplacé récemment : ne pas le redéplacer tout de suite
+    home: Tuple[int, ...] = ()   # nœud(s) où se trouve sa RAM après une évacuation
 
 
 class Placement(NamedTuple):
@@ -178,7 +182,8 @@ def place_one(req: Request, nodes: Sequence[Node], load: Dict[int, List[float]],
     if req.auto and req.current and not rebalance:
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:
-            return _keep_or_evacuate(req, same[0], cands, nodes, load, cores_only)
+            back = _return_home(req, cands, nodes, load, cores_only)
+            return back or _keep_or_evacuate(req, same[0], cands, nodes, load, cores_only)
     return _best(req, cands, nodes, load, cores_only, "équilibrage")
 
 
@@ -187,6 +192,19 @@ def _peak(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]],
     """Taux d'occupation CPU du nœud le plus chargé de la fenêtre, invité compris."""
     share = cpu_weight(req) / len(win)
     return max((load[n.id][1] + share) / capacity(n, cores_only) for n in win)
+
+
+def _return_home(req: Request, cands: List[Tuple[Node, ...]], nodes: Sequence[Node],
+                 load: Dict[int, List[float]], cores_only: bool) -> Optional[Placement]:
+    """VM évacuée : la ramener sur le nœud de sa RAM dès que la charge y est retombée."""
+    home = tuple(sorted(req.home))
+    if not home or home == tuple(sorted(req.current)) or req.cooldown or req.usage is None:
+        return None
+    win = [w for w in cands if tuple(n.id for n in w) == home]
+    if not win or _peak(req, win[0], load, cores_only) > RETURN_LOAD:
+        return None
+    label = "retour près de sa RAM (nœud(s) {})".format(format_cpulist(home))
+    return _best(req, win, nodes, load, cores_only, label)
 
 
 def _keep_or_evacuate(req: Request, current: Tuple[Node, ...], cands: List[Tuple[Node, ...]],

@@ -118,8 +118,9 @@ def xcp_ng_epyc():
     return [core.Node(n, tuple(range(n * 8, n * 8 + 8)), 8, 32 * GB) for n in range(4)]
 
 
-def vm(key, vcpus, mem_gb, current, usage, **kw):
-    return req(key, vcpus, mem_gb, current=current, auto=True, **kw)._replace(usage=usage)
+def vm(key, vcpus, mem_gb, current, usage, home=(), cooldown=False, **kw):
+    return req(key, vcpus, mem_gb, current=current, auto=True, **kw)._replace(
+        usage=usage, home=tuple(home), cooldown=cooldown)
 
 
 class LoadBalancingTest(unittest.TestCase):
@@ -157,6 +158,31 @@ class LoadBalancingTest(unittest.TestCase):
         out = core.plan(xcp_ng_epyc(), [req("kdet1", 16, 16, current=[0, 1], auto=True),
                                         req("xoce", 4, 2, current=[1], auto=True)])
         self.assertEqual(out["xoce"].node_ids, (1,))
+
+    def test_evacuated_vm_returns_to_its_ram_when_load_drops(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 0.3),
+                                        vm("xoce", 4, 2, [2], 0.5, home=(1,))])
+        self.assertEqual(out["xoce"].node_ids, (1,))
+        self.assertIn("retour près de sa RAM (nœud(s) 1)", out["xoce"].reason)
+
+    def test_evacuated_vm_stays_away_while_big_vm_is_busy(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
+                                        vm("xoce", 4, 2, [2], 0.5, home=(1,))])
+        self.assertEqual(out["xoce"].node_ids, (2,))
+
+    def test_return_threshold_is_lower_than_evacuation_threshold(self):
+        # 16 vCPU sur 2 nœuds : 9 pCPU -> 4,5 par nœud ; avec la petite VM 5/8 = 62 % > 60 %
+        busy = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 9.0),
+                                         vm("xoce", 4, 2, [2], 0.5, home=(1,))])
+        self.assertEqual(busy["xoce"].node_ids, (2,))   # ni assez chargé pour évacuer, ni assez calme pour revenir
+        calm = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 4.0),
+                                         vm("xoce", 4, 2, [2], 0.5, home=(1,))])
+        self.assertEqual(calm["xoce"].node_ids, (1,))
+
+    def test_no_return_during_cooldown(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 0.3),
+                                        vm("xoce", 4, 2, [2], 0.5, home=(1,), cooldown=True)])
+        self.assertEqual(out["xoce"].node_ids, (2,))
 
     def test_new_vms_avoid_busy_nodes(self):
         out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),

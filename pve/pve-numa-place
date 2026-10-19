@@ -287,8 +287,14 @@ def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
     key = str(g.vmid)
     usage = st.usage(state, key) if state is not None else None
     cooling = state is not None and st.in_cooldown(state, key, now)
+    home = st.home(state, key, boot_id(g)) if state is not None else ()
     return Request(key, g.vcpus, g.guaranteed_mb, pci_nodes, current_nodes(g, nodes),
-                   is_auto(g), is_manual(g), g.elastic, usage, cooling)
+                   is_auto(g), is_manual(g), g.elastic, usage, cooling, home)
+
+
+def boot_id(g: Guest) -> str:
+    """PID QEMU : change à chaque démarrage de la VM (la RAM est alors réallouée)."""
+    return (_qemu_pid(g.vmid) or "") if g.kind == "qemu" else ""
 
 
 def cpu_seconds(g: Guest) -> float | None:
@@ -527,9 +533,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     ok = all([apply_one(p, g, args.live) for g, p in selected if p.nodes])
     if state is not None:
-        moved = [str(g.vmid) for g, p in selected
-                 if p.nodes and current_nodes(g, nodes) not in ((), p.node_ids)]
-        st.save(STATE, st.mark_moved(state, moved, now))
+        moves = {str(g.vmid): (before, p.node_ids) for g, p in selected if p.nodes
+                 for before in [current_nodes(g, nodes)] if before not in ((), p.node_ids)}
+        boots = {str(g.vmid): boot_id(g) for g, _ in selected}
+        st.save(STATE, st.record_moves(state, moves, boots, now))
     return 0 if ok else 1
 
 

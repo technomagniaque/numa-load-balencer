@@ -373,7 +373,8 @@ class BusyBigVmXe(FakeXe):
                         "other-config": "", "tags": "numa-auto", "VCPUs-params": "mask: " +
                         ",".join(map(str, list(range(8, 16)) + list(range(40, 48)))), "dom-id": "6"},
         }
-        self.cpu = iter([{"5": 100.0, "6": 10.0}, {"5": 175.0, "6": 12.5}])  # 15 et 0,5 pCPU sur 5 s
+        self.cpu = iter([{"5": 100.0, "6": 10.0}, {"5": 175.0, "6": 12.5},   # 15 et 0,5 pCPU sur 5 s
+                         {"5": 175.0, "6": 12.5}, {"5": 175.5, "6": 15.0}])  # puis 0,1 et 0,5 pCPU
 
     def __call__(self, cmd):
         if cmd == ["xl", "list"]:
@@ -405,3 +406,27 @@ class XcpngLoadBalancingTest(unittest.TestCase):
         self.assertEqual(state["u-big"]["ema"], 15.0)
         self.assertIn("moved", state["u-small"])
         self.assertNotIn("moved", state["u-big"])
+        self.assertEqual(state["u-small"]["home"], [1])  # sa RAM est restée sur le nœud 1
+
+    def test_small_vm_comes_back_to_its_ram_once_big_vm_calms_down(self):
+        from unittest import mock
+        m = load_script("xnp3", NUMA_DIR / "xcp-ng/xcpng-numa-place", {})
+        xe = BusyBigVmXe()
+        node1 = "mask: " + ",".join(map(str, list(range(8, 16)) + list(range(40, 48))))
+        with tempfile.TemporaryDirectory() as tmp:
+            m.STATE = os.path.join(tmp, "state.json")
+            args = ["apply", "--live", "--cores-only", "--sample", "5"]
+            with mock.patch("time.sleep"), mock.patch("time.time", return_value=1000.0), \
+                    mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
+                m.main(args, run=xe)
+            self.assertNotEqual(xe.vms["u-small"]["VCPUs-params"], node1)   # évacuée
+            # 20 min plus tard, la grosse VM est calme (lissage : 15 -> 7,5 -> 3,8 -> …)
+            for i, at in enumerate((2200.0, 2230.0, 2260.0)):
+                cpu = [{"5": 175.0, "6": 12.5}, {"5": 175.5, "6": 15.0}]
+                xe.cpu = iter(cpu)
+                with mock.patch("time.sleep"), mock.patch("time.time", return_value=at), \
+                        mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
+                    m.main(args, run=xe)
+            state = m.st.load(m.STATE)
+        self.assertEqual(xe.vms["u-small"]["VCPUs-params"], node1)           # revenue près de sa RAM
+        self.assertNotIn("home", state["u-small"])

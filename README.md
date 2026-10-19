@@ -17,6 +17,10 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
   Une VM « chaude » (≥ 50 % de ses vCPU et ≥ 2 pCPU) garde ses nœuds ; une petite VM dont les nœuds
   dépassent 85 % est **évacuée à chaud** vers les nœuds les moins chargés, si le gain dépasse 1 pCPU,
   puis ne rebouge pas pendant 10 min. `--sample 0` revient au calcul sur les vCPU nominaux.
+- **retour près de la RAM** : sous Xen, l'évacuation ne déplace que les vCPU ; la RAM reste sur le
+  nœud d'origine (retenu dans le fichier d'état). Quand ce nœud redescend sous 60 % (seuil plus bas
+  que les 85 % d'évacuation), la VM y revient. Si elle a redémarré entre-temps (domid ou PID
+  différent), sa RAM a été réallouée et l'origine est oubliée.
 - **ballooning** : seule la mémoire garantie compte (`memory-dynamic-min`, `<currentMemory>`,
   `balloon:`) ; une VM à ballooning n'est jamais liée strictement (`policy=preferred`).
 
