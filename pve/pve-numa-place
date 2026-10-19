@@ -14,7 +14,11 @@ Règles (calcul dans numa_core.py) :
   - --cores-only : un nœud « contient » ses cœurs physiques, pas ses threads SMT
   - tag « numa-manual » ou pinning posé à la main sans tag « numa-auto » -> ignoré
 
-KVM : affinity (tous les threads QEMU) + numaN hostnodes=… policy=bind
+Ballooning (balloon: N < memory) : seuls les N Mo garantis comptent dans la charge,
+et la VM est en policy=preferred (un nœud plein déborde au lieu de tuer la VM).
+Les nœuds NUMA de l'invité (numaN memory=) restent dimensionnés sur « memory ».
+
+KVM : affinity (tous les threads QEMU) + numaN hostnodes=… policy=bind|preferred
 LXC : lxc.cgroup2.cpuset.cpus / lxc.cgroup2.cpuset.mems
 """
 from __future__ import annotations
@@ -162,6 +166,15 @@ class Guest:
     mem_mb: int
     pci: tuple[str, ...]
     tags: tuple[str, ...]
+    mem_min_mb: int = 0            # plancher du ballooning (KVM), 0 si pas de ballooning
+
+    @property
+    def guaranteed_mb(self) -> int:
+        return self.mem_min_mb or self.mem_mb
+
+    @property
+    def elastic(self) -> bool:
+        return 0 < self.mem_min_mb < self.mem_mb
 
     def get(self, key: str) -> str | None:
         vals = self.conf.get(key)
@@ -211,9 +224,11 @@ def load_guest(kind: str, path: str) -> Guest:
     else:
         vcpus = int(get("cores", "1"))
     tags = tuple(t for t in re.split(r"[;, ]+", get("tags", "")) if t)
+    # balloon: N = plancher du ballooning ; absent ou 0 = pas de plage dynamique
+    balloon = int(get("balloon", "0")) if kind == "qemu" else 0
     return Guest(kind, int(os.path.basename(path).split(".")[0]), path,
                  tuple(main), tuple(rest), conf, vcpus, mem,
-                 tuple(guest_pci(kind, conf)), tags)
+                 tuple(guest_pci(kind, conf)), tags, balloon if 0 < balloon < mem else 0)
 
 
 def load_guests() -> list[Guest]:
@@ -261,8 +276,8 @@ def current_nodes(g: Guest, nodes: list[Node]) -> tuple[int, ...]:
 
 def to_request(g: Guest, nodes: list[Node]) -> Request:
     pci_nodes = tuple(n for n in (pci_node(a) for a in g.pci) if n is not None)
-    return Request(str(g.vmid), g.vcpus, g.mem_mb, pci_nodes,
-                   current_nodes(g, nodes), is_auto(g), is_manual(g))
+    return Request(str(g.vmid), g.vcpus, g.guaranteed_mb, pci_nodes,
+                   current_nodes(g, nodes), is_auto(g), is_manual(g), g.elastic)
 
 
 # ---------------------------------------------------------------- application
@@ -442,7 +457,8 @@ def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
 def show_plan(pairs: list[tuple[Guest, Placement]]) -> None:
     for g, p in pairs:
         where = f"nœud {format_cpulist(p.node_ids):<5} {p.policy:<9}" if p.nodes else "-" * 21
-        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {g.mem_mb:>7} Mo  {where}  {p.reason}")
+        mem = f"{g.mem_min_mb}-{g.mem_mb}" if g.elastic else str(g.mem_mb)
+        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {mem:>11} Mo  {where}  {p.reason}")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -97,6 +97,9 @@ class NumaXenTest(unittest.TestCase):
             self.assertEqual(xen.pci_node("0000:41:01.0", pci, tmp), 2)
             self.assertIsNone(xen.pci_node("0000:99:00.0", pci, tmp))
 
+    def test_dom0_memory(self):
+        self.assertEqual(xen.dom0_memory(FakeXl()), {0: 8192})
+
     def test_old_domain_header_format(self):
         text = "Memory location of each domain:\n(XEN) Domain 7 (total: 256):\n(XEN)     Node 1: 256\n"
         self.assertEqual(xen.parse_domain_memory(text), {7: {1: 1}})
@@ -118,6 +121,9 @@ class FakeXe(FakeXl):
             "u-vf": {"name-label": "debian13vf", "VCPUs-max": "2", "memory-static-max": str(2**30),
                      "other-config": "pci: 0/0000:41:01.2", "tags": "", "VCPUs-params": "",
                      "dom-id": "-1"},
+            "u-dmc": {"name-label": "dmc48", "VCPUs-max": "4", "memory-static-max": str(48 * 2**30),
+                      "memory-dynamic-min": str(4 * 2**30), "other-config": "", "tags": "",
+                      "VCPUs-params": "", "dom-id": "-1"},
             "u-big": {"name-label": "grosse", "VCPUs-max": "24", "memory-static-max": str(8 * 2**30),
                       "other-config": "", "tags": "", "VCPUs-params": "", "dom-id": "-1"},
         }
@@ -167,6 +173,9 @@ class XcpngTest(unittest.TestCase):
         self.assertEqual(self.plan()["grosse"][1].node_ids, (0, 1))  # 24 vCPU / 16 threads
         self.assertEqual(len(p["debian13kdet1"][1].node_ids), 1)
         self.assertEqual(p["debian13vf"][1].node_ids, (2,))  # VF -> physfn -> PF0, nœud 2
+        self.assertEqual(len(p["dmc48"][1].node_ids), 1)       # 4 Go garantis sur 48 Go max
+        self.assertIn("ballooning", p["dmc48"][1].reason)
+        self.assertEqual(p["dmc48"][0].guaranteed_mb, 4096)
 
     def test_apply_sets_mask_tag_and_live_pin_then_idempotent(self):
         for vm, p in self.plan().values():
@@ -182,6 +191,22 @@ class XcpngTest(unittest.TestCase):
             if p.nodes:
                 self.m.apply_one(vm, p, live=False, run=self.xe)
         self.assertFalse([c for c in self.xe.calls if c[1] in ("vm-param-set", "vm-param-add")])
+
+    def test_plan_reserves_dom0_memory(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            self.m.main(["plan"], run=self.xe)
+        self.assertIn(["xl", "debug-keys", "u"], self.xe.calls)
+        self.assertIn("dom0 : N0=8192M", err.getvalue())
+        nodes, pci = xen.read_topology(self.xe)
+        vms = self.m.load_vms(self.xe)
+        free = {vm.name: p.node_ids for vm, p in self.m.build_plan(nodes, pci, vms)}
+        node = free["debian13kdet1"][0]
+        held = {vm.name: p.node_ids for vm, p in
+                self.m.build_plan(nodes, pci, vms, reserved_mb={node: 31000})}
+        self.assertNotIn(node, held["debian13kdet1"])  # nœud pris par le dom0 : la VM part ailleurs
 
     def test_status_shows_memory_per_node(self):
         import io
@@ -207,6 +232,9 @@ DOMAIN_IA = """<domain type='xen'>
 DOMAIN_WEB = """<domain type='xen'><name>web</name><memory unit='GiB'>4</memory>
 <vcpu>2</vcpu><devices><interface type='network'><source network='chelsio-vf'/></interface></devices></domain>"""
 
+DOMAIN_BAL = """<domain type='xen'><name>bal</name><memory unit='GiB'>48</memory>
+<currentMemory unit='GiB'>4</currentMemory><vcpu>4</vcpu></domain>"""
+
 DOMAIN_MAN = """<domain type='xen'><name>man</name><memory unit='MiB'>1024</memory>
 <vcpu cpuset='0-1'>2</vcpu></domain>"""
 
@@ -219,7 +247,8 @@ DOMAIN_DB = """<domain type='xen'><name>db</name><memory unit='GiB'>2</memory><v
 class FakeVirsh(FakeXl):
     def __init__(self, sysfs: Path):
         super().__init__()
-        self.defs = {"ia": DOMAIN_IA, "web": DOMAIN_WEB, "man": DOMAIN_MAN, "db": DOMAIN_DB}
+        self.defs = {"ia": DOMAIN_IA, "web": DOMAIN_WEB, "man": DOMAIN_MAN, "db": DOMAIN_DB,
+                     "bal": DOMAIN_BAL}
         self.nets = {
             "chelsio-vf": "<network><forward mode='hostdev'><pf dev='enp34s0f4'/></forward></network>",
             "chelsio-pool": "<network><forward mode='hostdev' managed='yes'>"
@@ -277,6 +306,13 @@ class XenLibvirtTest(unittest.TestCase):
         self.assertEqual(p["ia"][1].node_ids, (2,))
         self.assertEqual(p["web"][1].node_ids, (1,))
         self.assertEqual(p["man"][1].nodes, ())
+
+    def test_current_memory_is_the_guaranteed_memory(self):
+        vm, p = self.plan()["bal"]
+        self.assertEqual((vm.mem_min_mb, vm.mem_mb), (4096, 49152))
+        self.assertEqual(len(p.node_ids), 1)
+        self.assertIn("ballooning", p.reason)
+        self.assertEqual(self.plan()["ia"][0].mem_min_mb, 0)  # pas de currentMemory
 
     def test_vf_pool_listed_by_address_uses_pf_node(self):
         p = self.plan()

@@ -3,6 +3,10 @@
 Ce module ne lit ni n'écrit rien sur l'hôte : il reçoit la topologie et les
 besoins des invités, et rend le placement. Compatible Python 3.6 (dom0 XCP-ng 8.3).
 
+La mémoire d'un invité est sa mémoire GARANTIE (plancher du ballooning) : c'est
+elle qui compte dans la charge des nœuds. Un invité à ballooning n'est jamais lié
+strictement (policy preferred) : s'il regonfle sur un nœud plein, il déborde.
+
 Règles :
   - un invité occupe le plus petit nombre de nœuds qui le contient (vCPU et RAM) ;
   - s'il en faut plusieurs, ce sont des nœuds CONTIGUS (numéros consécutifs) ;
@@ -25,11 +29,12 @@ class Node(NamedTuple):
 class Request(NamedTuple):
     key: str                     # identifiant de l'invité (vmid, uuid…)
     vcpus: int
-    mem_mb: int
+    mem_mb: int                  # mémoire GARANTIE : minimum du ballooning, sinon la taille fixe
     pci_nodes: Tuple[int, ...]   # nœuds des cartes en passthrough, la 1re prioritaire
     current: Tuple[int, ...]     # nœuds actuellement configurés, () si aucun
     auto: bool                   # déjà géré par l'outil (tag numa-auto)
     manual: bool                 # à laisser tel quel
+    elastic: bool = False        # ballooning actif : la RAM peut dépasser mem_mb
 
 
 class Placement(NamedTuple):
@@ -129,9 +134,11 @@ def _best(req: Request, cands: List[Tuple[Node, ...]], nodes: Sequence[Node],
     # fenêtres alignées d'abord (0-1, 2-3…) : évite d'isoler des nœuds seuls
     aligned = [w for w in pool if _position(w[0], nodes) % len(w) == 0] or pool
     win = min(aligned, key=lambda w: (_score(req, w, load, cores_only), w[0].id))
-    policy = "bind" if fitting else "preferred"
+    # avec ballooning, la RAM peut regonfler au-delà du nœud : jamais de liaison stricte
+    policy = "bind" if fitting and not req.elastic else "preferred"
     span = "" if len(win) == 1 else ", {} nœuds contigus".format(len(win))
-    return Placement(req.key, win, policy, reason + span)
+    balloon = ", ballooning" if req.elastic else ""
+    return Placement(req.key, win, policy, reason + span + balloon)
 
 
 def place_one(req: Request, nodes: Sequence[Node], load: Dict[int, List[float]],
@@ -164,8 +171,10 @@ def _add_load(load: Dict[int, List[float]], req: Request, ids: Sequence[int]) ->
 
 
 def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = False,
-         rebalance: bool = False) -> Dict[str, Placement]:
-    load = {n.id: [0.0, 0.0] for n in nodes}  # type: Dict[int, List[float]]
+         rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None
+         ) -> Dict[str, Placement]:
+    """reserved_mb : mémoire déjà prise par nœud hors invités (ex. dom0 Xen), en Mo."""
+    load = {n.id: [float((reserved_mb or {}).get(n.id, 0)), 0.0] for n in nodes}  # type: Dict[int, List[float]]
     for r in reqs:
         if r.manual and r.current:
             _add_load(load, r, r.current)

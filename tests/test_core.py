@@ -18,8 +18,8 @@ def epyc_7551p():
                       8, 32 * GB) for n in range(4)]
 
 
-def req(key, vcpus, mem_gb, pci=(), current=(), auto=False, manual=False):
-    return core.Request(key, vcpus, int(mem_gb * GB), tuple(pci), tuple(current), auto, manual)
+def req(key, vcpus, mem_gb, pci=(), current=(), auto=False, manual=False, elastic=False):
+    return core.Request(key, vcpus, int(mem_gb * GB), tuple(pci), tuple(current), auto, manual, elastic)
 
 
 class CpuListTest(unittest.TestCase):
@@ -77,6 +77,34 @@ class PlanTest(unittest.TestCase):
     def test_rebalance_moves_kept_guest(self):
         out = core.plan(epyc_7551p(), [req("a", 4, 4, current=[3], auto=True)], rebalance=True)
         self.assertEqual(out["a"].node_ids, (0,))
+
+    def test_reserved_memory_pushes_guest_off_dom0_node(self):
+        reqs = [req("v", 4, 8)]
+        self.assertEqual(core.plan(epyc_7551p(), reqs)["v"].node_ids, (0,))
+        out = core.plan(epyc_7551p(), reqs, reserved_mb={0: 8 * GB})
+        self.assertNotEqual(out["v"].node_ids, (0,))
+
+    def test_reserved_memory_turns_bind_into_preferred(self):
+        out = core.plan(epyc_7551p(), [req("g", 8, 24, pci=[0])], reserved_mb={0: 8 * GB})
+        self.assertEqual(out["g"].node_ids, (0,))      # la carte décide du nœud
+        self.assertEqual(out["g"].policy, "preferred")  # 8 + 24 Go > 90 % de 32 Go
+
+    def test_no_reservation_keeps_previous_behaviour(self):
+        reqs = [req("a", 4, 8), req("b", 4, 8, pci=[3])]
+        self.assertEqual(core.plan(epyc_7551p(), reqs), core.plan(epyc_7551p(), reqs, reserved_mb={}))
+
+    def test_elastic_guest_is_never_bound(self):
+        p = core.plan(epyc_7551p(), [req("b", 4, 4, elastic=True)])["b"]
+        self.assertEqual(p.policy, "preferred")
+        self.assertIn("ballooning", p.reason)
+
+    def test_fifty_ballooned_vms_spread_over_all_nodes(self):
+        """50 VM à 2 Go garantis (128 Go de RAM) : toutes placées, réparties sur les 4 nœuds."""
+        reqs = [req("vm%02d" % i, 2, 2, elastic=True) for i in range(50)]
+        out = core.plan(epyc_7551p(), reqs)
+        per_node = [sum(1 for p in out.values() if p.node_ids == (n,)) for n in range(4)]
+        self.assertEqual(sum(per_node), 50)
+        self.assertLessEqual(max(per_node) - min(per_node), 1)
 
     def test_overcommitted_memory_falls_back_to_preferred(self):
         out = core.plan(epyc_7551p(), [req("g", 8, 30, pci=[1]), req("h", 8, 20, pci=[1])])

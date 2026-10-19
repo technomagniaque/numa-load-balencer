@@ -111,6 +111,11 @@ def domain_memory(run: Runner = run_cmd) -> Dict[int, Dict[int, int]]:
     return parse_domain_memory(run(["xl", "dmesg"]) or "")
 
 
+def dom0_memory(run: Runner = run_cmd) -> Dict[int, int]:
+    """Mémoire du dom0 par nœud (Mo), à réserver dans le calcul du placement."""
+    return {n: mb for n, mb in domain_memory(run).get(0, {}).items() if mb}
+
+
 def pin_live(domain: str, cpus: Sequence[int], run: Runner = run_cmd) -> bool:
     """Épingle à chaud tous les vCPU d'un domaine (affinité dure)."""
     return run(["xl", "vcpu-pin", domain, "all", core.format_cpulist(cpus)]) is not None

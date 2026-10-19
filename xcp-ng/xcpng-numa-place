@@ -15,6 +15,8 @@ Règles (calcul dans numa_core.py, topologie lue par numa_xen.py via « xl info 
 Application : VCPUs-params:mask (affinité dure). Xen en déduit l'affinité de nœud
 du domaine et y alloue sa mémoire au démarrage suivant. --live épingle aussi les
 vCPU tout de suite (xl vcpu-pin) ; la mémoire ne bouge qu'au redémarrage de la VM.
+Ballooning (DMC) : seule la mémoire garantie (memory-dynamic-min) compte dans la
+charge des nœuds ; au-delà, Xen alloue sur le nœud de la VM tant qu'il a de la place.
 Compatible Python 3.6 (dom0 XCP-ng 8.3).
 """
 import argparse
@@ -55,6 +57,15 @@ class Vm(NamedTuple):
     tags: Tuple[str, ...]
     mask: Tuple[int, ...]       # VCPUs-params:mask, () si absent
     domid: Optional[int]        # None si arrêtée
+    mem_min_mb: int = 0         # memory-dynamic-min (plancher du ballooning)
+
+    @property
+    def guaranteed_mb(self) -> int:
+        return self.mem_min_mb or self.mem_mb
+
+    @property
+    def elastic(self) -> bool:
+        return 0 < self.mem_min_mb < self.mem_mb
 
 
 # ---------------------------------------------------------------- lecture xe
@@ -106,6 +117,7 @@ def _on_this_host(run: xen.Runner, uuid: str, host: str, single_host: bool) -> b
 def load_vm(run: xen.Runner, uuid: str) -> Vm:
     mask = xe_map(run, uuid, "VCPUs-params").get("mask", "")
     domid = xe_get(run, uuid, "dom-id")
+    dyn_min = int(xe_get(run, uuid, "memory-dynamic-min") or 0) // 2**20
     return Vm(
         uuid=uuid,
         name=xe_get(run, uuid, "name-label"),
@@ -115,6 +127,7 @@ def load_vm(run: xen.Runner, uuid: str) -> Vm:
         tags=parse_tags(xe_get(run, uuid, "tags")),
         mask=core.parse_cpulist(mask) if mask else (),
         domid=int(domid) if domid.isdigit() and int(domid) > 0 else None,
+        mem_min_mb=dyn_min,
     )
 
 
@@ -141,14 +154,17 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> cor
     found = (xen.pci_node(a, pci_nodes, SYSFS) for a in vm.pci)
     cards = tuple(n for n in found if n is not None)
     current = core.nodes_of_cpus(vm.mask, nodes) if vm.mask else ()
-    return core.Request(vm.uuid, vm.vcpus, vm.mem_mb, cards, current, is_auto(vm), is_manual(vm))
+    return core.Request(vm.uuid, vm.vcpus, vm.guaranteed_mb, cards, current,
+                        is_auto(vm), is_manual(vm), vm.elastic)
 
 
 def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
-               cores_only: bool = False, rebalance: bool = False
+               cores_only: bool = False, rebalance: bool = False,
+               reserved_mb: Optional[Dict[int, int]] = None
                ) -> List[Tuple[Vm, core.Placement]]:
     reqs = [to_request(vm, nodes, pci_nodes) for vm in vms]
-    placements = core.plan(nodes, reqs, cores_only, rebalance)
+    placements = core.plan(nodes, reqs, cores_only, rebalance,
+                           reserved_mb)
     return [(vm, placements[vm.uuid]) for vm in sorted(vms, key=lambda v: v.name)]
 
 
@@ -175,8 +191,9 @@ def apply_one(vm: Vm, p: core.Placement, live: bool, run: xen.Runner = xen.run_c
 def show_plan(pairs: List[Tuple[Vm, core.Placement]]) -> None:
     for vm, p in pairs:
         where = "nœud {:<5}".format(core.format_cpulist(p.node_ids)) if p.nodes else "-" * 10
-        print("{:<24} {:>3} vCPU {:>7} Mo  {}  {}".format(
-            vm.name[:24], vm.vcpus, vm.mem_mb, where, p.reason))
+        mem = "{}-{}".format(vm.mem_min_mb, vm.mem_mb) if vm.elastic else str(vm.mem_mb)
+        print("{:<24} {:>3} vCPU {:>11} Mo  {}  {}".format(
+            vm.name[:24], vm.vcpus, mem, where, p.reason))
 
 
 def show_status(pairs: List[Tuple[Vm, core.Placement]], run: xen.Runner) -> None:
@@ -204,7 +221,9 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
     if len(nodes) < 2:
         log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
         return 0
-    pairs = build_plan(nodes, pci_nodes, load_vms(run), args.cores_only, args.rebalance)
+    dom0 = xen.dom0_memory(run)  # réservé : Xen ne déplace pas la RAM du dom0
+    log("dom0 : " + xen.format_memory(dom0))
+    pairs = build_plan(nodes, pci_nodes, load_vms(run), args.cores_only, args.rebalance, dom0)
     selected = [(vm, p) for vm, p in pairs
                 if not args.vms or vm.name in args.vms or vm.uuid in args.vms]
     if args.cmd == "plan":

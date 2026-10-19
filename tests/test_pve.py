@@ -149,6 +149,22 @@ class PveTest(unittest.TestCase):
     def test_split_guest_with_fewer_vcpus_than_nodes(self):
         self.assertEqual(self.m.split_guest(1, 100, (2, 3)), [("0", "2-3", 100)])
 
+    def test_ballooning_vm_counts_floor_and_is_preferred(self):
+        self.host.vm(100, "cores: 4\nmemory: 32768\nballoon: 4096\n")
+        g, p = self.plan()[100]
+        self.assertEqual(p.node_ids.__len__(), 1)   # 4 Go garantis : un seul nœud
+        self.assertEqual(p.policy, "preferred")
+        self.apply_all()
+        conf = (self.root / "pve/qemu-server/100.conf").read_text()
+        self.assertRegex(conf, r"numa0: cpus=0-3,hostnodes=\d,memory=32768,policy=preferred")
+
+    def test_balloon_zero_or_equal_means_fixed_memory(self):
+        self.host.vm(100, "cores: 4\nmemory: 8192\nballoon: 0\n")
+        self.host.vm(101, "cores: 4\nmemory: 8192\nballoon: 8192\n")
+        p = self.plan()
+        self.assertEqual(p[100][1].policy, "bind")
+        self.assertEqual(p[101][1].policy, "bind")
+
     def test_manual_and_opt_out_untouched(self):
         self.host.vm(400, "cores: 2\nmemory: 2048\naffinity: 0-3\n")
         self.host.vm(401, "cores: 2\nmemory: 2048\ntags: numa-manual\n")
