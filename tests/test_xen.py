@@ -1,6 +1,6 @@
 """Tests des versions Xen : numa_xen (xl), xcpng-numa-place (xe) et xen-numa-place (virsh).
 
-    python3 -m unittest discover -s numa/tests -v
+    python3 -m unittest discover -s tests -v
 """
 import os
 import sys

@@ -1,6 +1,6 @@
-# numa-place — placement NUMA automatique (Proxmox, XCP-ng, Xen + libvirt)
+# numa-load-balencer — placement et équilibrage NUMA des VM (Proxmox, XCP-ng, Xen + libvirt)
 
-Hôte cible : EPYC 7551P (4 nœuds de 8 cœurs / 16 threads), P40 et Chelsio T6225-CR en passthrough.
+Développé et testé sur : EPYC 7551P (4 nœuds de 8 cœurs / 16 threads), P40 et Chelsio T6225-CR en passthrough.
 Sur `xcp-ng-epyc` (XCP-ng 8.3, Xen 4.17, Python 3.6.8), le SMT est désactivé : 8 pCPU par nœud,
 la P40 (`0000:61:00.0`) est sur le nœud 3. Sortie réelle de `xl info -n` : `tests/fixtures/`.
 
@@ -55,12 +55,12 @@ Release `numa-place X.Y.Z` avec les trois `.deb` et `SHA256SUMS`.
 Construction locale, sans dpkg (paquets identiques au bit près à ceux de la CI) :
 
 ```bash
-python3 numa/packaging/build_deb.py --out dist
+python3 packaging/build_deb.py --out dist
 ```
 
 ## Installation (sur l'hôte, en root)
 
-Copier le dossier `numa/` sur l'hôte, puis, selon la plateforme (`pve`, `xcp-ng` ou `xen-libvirt`) :
+Copier le dépôt sur l'hôte, puis, selon la plateforme (`pve`, `xcp-ng` ou `xen-libvirt`) :
 
 ```bash
 install -d /usr/local/lib/numa-place && install -m644 numa_core.py numa_state.py numa_xen.py /usr/local/lib/numa-place/
@@ -117,5 +117,5 @@ pve-numa-place status
 ## Tests
 
 ```bash
-python3 -m unittest discover -s numa/tests -v
+python3 -m unittest discover -s tests -v
 ```

@@ -1,6 +1,6 @@
 """Tests de pve-numa-place sur un hôte Proxmox simulé (EPYC 7551P : 4 nœuds).
 
-    python3 -m unittest discover -s numa/tests -v
+    python3 -m unittest discover -s tests -v
 """
 import importlib.machinery
 import importlib.util

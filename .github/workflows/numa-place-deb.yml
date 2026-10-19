@@ -1,0 +1,82 @@
+# Construit les .deb de numa-place sur Debian 13 et les publie en Release GitHub.
+#
+#   tag numa-place-vX.Y.Z poussé  -> tests, paquets, essai d'installation, Release vX.Y.Z
+#   pull request / push sur main   -> tests, paquets, essai d'installation (artefact seul)
+#   lancement manuel              -> idem, version 0.0.0~ciN
+name: numa-place .deb
+
+on:
+  push:
+    branches: [main]
+    tags: ["numa-place-v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # création de la Release sur un tag
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    steps:
+      - name: Outils Debian 13
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3 dpkg-dev lintian
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tests unitaires
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#numa-place-v}"
+          else
+            version="0.0.0~ci${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Construction des paquets
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 packaging/build_deb.py --version "$VERSION" --out dist
+          (cd dist && sha256sum *.deb > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Contrôle dpkg et lintian
+        run: |
+          for deb in dist/*.deb; do
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+          done
+          lintian --info --no-tag-display-limit dist/*.deb || true
+
+      - name: Essai d'installation et de désinstallation
+        run: |
+          apt-get install -y ./dist/*.deb
+          pve-numa-place --help
+          xen-numa-place --help
+          test -f /usr/lib/systemd/system/pve-numa-place.timer
+          apt-get purge -y pve-numa-place xen-numa-place numa-place-common
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: numa-place-${{ env.VERSION }}
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+
+      - name: Release GitHub
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: numa-place ${{ env.VERSION }}
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS

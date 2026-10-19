@@ -1,6 +1,6 @@
 """Tests du calcul de placement (numa_core), sans aucun accès à l'hôte.
 
-    python3 -m unittest discover -s numa/tests -v
+    python3 -m unittest discover -s tests -v
 """
 import os
 import sys

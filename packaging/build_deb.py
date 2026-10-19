@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """build_deb.py — construit les paquets .deb de numa-place sans dpkg ni debhelper.
 
-    python3 numa/packaging/build_deb.py --version 0.2.0 --out dist/
+    python3 packaging/build_deb.py --version 0.2.0 --out dist/
 
 Produit (Architecture: all, Debian 13 / Proxmox VE 8-9) :
   numa-place-common  numa_core.py, numa_state.py           (/usr/lib/numa-place)
@@ -25,9 +25,10 @@ import tarfile
 from typing import Dict, List, NamedTuple, Tuple
 
 NUMA = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REPO = os.path.dirname(NUMA)
-MAINTAINER = "technomagniaque <technomagniaque@users.noreply.github.com>"
-HOMEPAGE = "https://github.com/technomagniaque/pve"
+# dépôt autonome (code à la racine) ou ancien emplacement numa/ dans un autre dépôt
+REPO = NUMA if os.path.exists(os.path.join(NUMA, "LICENSE")) else os.path.dirname(NUMA)
+MAINTAINER = "technomagniaque <38930713+technomagniaque@users.noreply.github.com>"
+HOMEPAGE = "https://github.com/technomagniaque/numa-load-balencer"
 LIB = "usr/lib/numa-place"
 UNITS = "usr/lib/systemd/system"
 
@@ -62,7 +63,7 @@ def doc(name: str) -> Tuple[File, ...]:
     with open(os.path.join(REPO, "LICENSE"), "rb") as fh:
         licence = fh.read()
     copyright_ = (b"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"
-                  b"Upstream-Name: numa-place\nSource: " + HOMEPAGE.encode() + b"\n\n"
+                  b"Upstream-Name: numa-load-balencer\nSource: " + HOMEPAGE.encode() + b"\n\n"
                   b"Files: *\nCopyright: 2025-2026 technomagniaque\nLicense: BSD-2-Clause\n " +
                   b"\n ".join(line or b"." for line in licence.strip().splitlines()) + b"\n")
     return (File("usr/share/doc/{}/copyright".format(name), copyright_),
