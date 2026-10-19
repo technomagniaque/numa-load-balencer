@@ -33,12 +33,15 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 
 | Fichier | Rôle | Python |
 |---|---|---|
-| `numa_core.py` | calcul du placement, commun aux trois outils | 3.6+ |
+| `numa_core.py` | calcul du placement, commun à tous les outils | 3.6+ |
+| `numa_linux.py` | hôte Linux nu : topologie sysfs, frères SMT, nœud des cartes PCI, RAM par nœud | 3.6+ |
+| `numa_libvirt.py` | domaines libvirt : lecture (vCPU, ballooning, hostdev, VF) et écriture XML | 3.6+ |
 | `numa_xen.py` | topologie et nœud des cartes PCI via `xl info -n` | 3.6+ |
 | `numa_state.py` | consommation lissée et délai après déplacement (fichier d'état) | 3.6+ |
 | `pve/pve-numa-place` | Proxmox VE 8/9 : KVM (`affinity`, `numaN hostnodes`) et LXC (`cpuset`) | 3.9+ |
 | `xcp-ng/xcpng-numa-place` | XCP-ng 8.3 : `VCPUs-params:mask` + tag `numa-auto` | 3.6+ |
 | `xen-libvirt/xen-numa-place` | Debian 13 dom0 + libvirt (libxl) : `<vcpu cpuset>` + `<metadata>` | 3.6+ |
+| `kvm/kvm-numa-place` | KVM + libvirt (virt-manager, Cockpit) : `<vcpu cpuset>` + `<numatune>`, `virsh vcpupin` à chaud | 3.6+ |
 
 ## Matériel pris en charge
 
@@ -54,17 +57,24 @@ Testé (tests unitaires) sur : EPYC Zen 1 (4 nœuds, SMT désactivé ou SMT2), D
 SMT8, cœurs hybrides, ARM sans SMT. Sous Xen sur ARM, la topologie NUMA n'est fournie que par les
 versions récentes de Xen : sans `cpu_topology`, l'outil voit un seul nœud et ne fait rien.
 
-## Paquets .deb (Debian 13 et Proxmox VE)
+## Paquets (.deb et RPM)
 
 | Paquet | Pour | Contenu |
 |---|---|---|
-| `numa-place-common` | tous | `numa_core.py`, `numa_state.py` dans `/usr/lib/numa-place` |
-| `pve-numa-place` | Proxmox VE 8/9 | outil KVM + LXC, `/usr/sbin/pve-numa-place`, service + timer |
-| `xen-numa-place` | Debian 13 dom0 Xen + libvirt | outil Xen, `numa_xen.py`, service + timer |
+| `numa-place-common` (.deb) | Debian, Ubuntu, Proxmox | modules communs dans `/usr/lib/numa-place` |
+| `pve-numa-place` (.deb) | Proxmox VE 8/9 | outil KVM + LXC, service + timer |
+| `xen-numa-place` (.deb) | Debian 13 dom0 Xen + libvirt | outil Xen, `numa_xen.py`, service + timer |
+| `kvm-numa-place` (.deb) | Debian/Ubuntu + KVM + libvirt (virt-manager) | outil KVM, service + timer |
+| `kvm-numa-place-*.el9` / `.el10` (RPM) | Rocky / Alma / RHEL 9 et 10 + KVM + libvirt | tout en un, service + timer |
+| `xcpng-numa-place-*.xcpng8.3` (RPM) | XCP-ng 8.3 | tout en un (charge gzip, lisible par rpm 4.11), service + timer |
 
 Les timers sont installés **sans être activés** : relire `… plan`, puis
-`systemctl enable --now pve-numa-place.timer pve-numa-place.service` (ou `xen-…`).
-XCP-ng (RPM, Python 3.6) garde l'installation manuelle ci-dessous.
+`systemctl enable --now kvm-numa-place.timer kvm-numa-place.service` (ou `pve-…`, `xen-…`, `xcpng-…`).
+
+```bash
+dnf install ./kvm-numa-place-*.el9.noarch.rpm        # Rocky 9 (el10 : Rocky 10)
+yum install ./xcpng-numa-place-*.xcpng8.3.noarch.rpm # XCP-ng 8.3
+```
 
 ```bash
 apt install ./numa-place-common_*_all.deb ./pve-numa-place_*_all.deb

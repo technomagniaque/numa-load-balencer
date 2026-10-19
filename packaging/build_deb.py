@@ -4,9 +4,10 @@
     python3 packaging/build_deb.py --version 0.2.0 --out dist/
 
 Produit (Architecture: all, Debian 13 / Proxmox VE 8-9) :
-  numa-place-common  numa_core.py, numa_state.py           (/usr/lib/numa-place)
+  numa-place-common  numa_core, numa_state, numa_linux, numa_libvirt (/usr/lib/numa-place)
   pve-numa-place     outil Proxmox (KVM + LXC) + timer systemd
   xen-numa-place     outil Xen + libvirt (dom0 Debian 13) + numa_xen.py + timer
+  kvm-numa-place     outil KVM + libvirt (virt-manager, Debian/Ubuntu) + timer
 
 Un .deb est une archive « ar » : debian-binary, control.tar.gz, data.tar.gz.
 Ce script l'écrit lui-même, avec des fichiers root:root et des dates fixes
@@ -34,6 +35,7 @@ REPO = NUMA if os.path.exists(os.path.join(NUMA, "LICENSE")) else os.path.dirnam
 MAINTAINER = "technomagniaque <38930713+technomagniaque@users.noreply.github.com>"
 HOMEPAGE = "https://github.com/technomagniaque/numa-load-balencer"
 LIB = "usr/lib/numa-place"
+COMMON_MODULES = ("numa_core.py", "numa_state.py", "numa_linux.py", "numa_libvirt.py")
 UNITS = "usr/lib/systemd/system"
 
 
@@ -111,7 +113,7 @@ if [ "$1" = purge ]; then
     rmdir /var/lib/numa-place 2>/dev/null || true
 fi
 exit 0
-""".format(state="pve-state.json" if tool.startswith("pve") else "xen-state.json"),
+""".format(state=tool.split("-")[0] + "-state.json"),
     }
 
 
@@ -122,8 +124,7 @@ def packages() -> List[Package]:
         " Calcul du placement NUMA (nœuds contigus, passthrough PCI, ballooning,\n"
         " équilibrage sur la charge CPU réelle) partagé par pve-numa-place et\n"
         " xen-numa-place.",
-        (File(LIB + "/numa_core.py", read("numa_core.py")),
-         File(LIB + "/numa_state.py", read("numa_state.py"))) + doc("numa-place-common"),
+        tuple(File(LIB + "/" + m, read(m)) for m in COMMON_MODULES) + doc("numa-place-common"),
         {})
     pve = Package(
         "pve-numa-place", "numa-place-common (= {v}), python3 (>= 3.9)",  # taskset : util-linux, essentiel
@@ -154,7 +155,21 @@ def packages() -> List[Package]:
          File(UNITS + "/xen-numa-place.timer", unit("xen-libvirt", "xen-numa-place.timer")))
         + doc("xen-numa-place"),
         tool_scripts("xen-numa-place"))
-    return [common, pve, xen]
+    kvm = Package(
+        "kvm-numa-place", "numa-place-common (= {v}), python3 (>= 3.6), libvirt-clients", "",
+        "placement NUMA automatique des VM KVM gérées par libvirt (virt-manager)\n"
+        " Place vCPU et mémoire des VM QEMU/KVM sur le(s) même(s) nœud(s) NUMA via\n"
+        " <vcpu cpuset> et <numatune> (visibles dans virt-manager), garde les VM avec\n"
+        " passthrough sur le nœud de leur carte, ne donne jamais deux threads d'un même\n"
+        " cœur à une VM, et évacue à chaud les petites VM des nœuds saturés.\n"
+        " Timer systemd fourni, non activé à l'installation.",
+        (File(LIB + "/kvm-numa-place", read("kvm", "kvm-numa-place"), 0o755),
+         File("usr/sbin/kvm-numa-place", b"", 0o777, "../lib/numa-place/kvm-numa-place"),
+         File(UNITS + "/kvm-numa-place.service", unit("kvm", "kvm-numa-place.service")),
+         File(UNITS + "/kvm-numa-place.timer", unit("kvm", "kvm-numa-place.timer")))
+        + doc("kvm-numa-place"),
+        tool_scripts("kvm-numa-place"))
+    return [common, pve, xen, kvm]
 
 
 # ------------------------------------------------------------------ archives

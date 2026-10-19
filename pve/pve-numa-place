@@ -51,6 +51,7 @@ def _import_core():
 
 core = _import_core()
 import numa_state as st  # noqa: E402  (même dossier que numa_core)
+import numa_linux as linux  # noqa: E402
 Node, Request, Placement = core.Node, core.Request, core.Placement
 parse_cpulist, format_cpulist = core.parse_cpulist, core.format_cpulist
 
@@ -83,68 +84,20 @@ def _read(path: str) -> str | None:
 
 # ---------------------------------------------------------------- topologie
 
-def _siblings(cpus: tuple[int, ...]) -> dict[int, tuple[int, ...]]:
-    """Frères SMT de chaque CPU, tels que le noyau les calcule (x86, ARM, POWER, hybrides).
-
-    core_cpus_list (noyaux récents) ou thread_siblings_list ; à défaut, regroupement
-    par (paquet, core_id), qui n'est pas unique sur certains ARM."""
-    out: dict[int, tuple[int, ...]] = {}
-    by_core: dict[tuple, list[int]] = {}
-    for c in cpus:
-        topo = f"{SYSFS}/devices/system/cpu/cpu{c}/topology"
-        listed = _read(f"{topo}/core_cpus_list") or _read(f"{topo}/thread_siblings_list")
-        if listed and listed.strip():
-            out[c] = parse_cpulist(listed)
-            continue
-        key = ((_read(f"{topo}/physical_package_id") or "").strip(), (_read(f"{topo}/core_id") or str(c)).strip())
-        by_core.setdefault(key, []).append(c)
-    for group in by_core.values():
-        for c in group:
-            out[c] = tuple(group)
-    return out
-
-
-def _node_meminfo(nid: int) -> dict[str, int]:
-    text = _read(f"{SYSFS}/devices/system/node/node{nid}/meminfo") or ""
-    return {k: int(v) // 1024 for k, v in re.findall(r"Node \d+ (\w+):\s+(\d+) kB", text)}
-
-
 def host_memory_mb(nodes: list[Node], guests: list[Guest]) -> dict[int, int]:
-    """RAM prise par l'hôte hors invités, par nœud (Mo) : l'équivalent Proxmox du dom0.
-
-    Mémoire utilisée du nœud, sans le cache de pages (récupérable), moins la RAM
-    des VM et conteneurs en marche sur ce nœud. Reste : services Proxmox, noyau,
-    et surtout l'ARC de ZFS, que le placement doit laisser libre."""
-    in_guests: dict[int, int] = {}
+    """RAM prise par l'hôte hors invités (services Proxmox, ARC ZFS), par nœud :
+    l'équivalent Proxmox du dom0 Xen (calcul dans numa_linux)."""
+    mems = []
     for g in guests:
         pid = _qemu_pid(g.vmid) if g.kind == "qemu" else None
         if g.kind == "qemu" and not pid:
             continue
-        per_node = _numa_maps_mb(pid) if pid else _lxc_numa_mb(g.vmid)
-        for nid, mb in per_node.items():
-            in_guests[nid] = in_guests.get(nid, 0) + mb
-    out = {}
-    for n in nodes:
-        info = _node_meminfo(n.id)
-        if "MemFree" not in info:   # meminfo incomplet : ne rien réserver plutôt que tout
-            out[n.id] = 0
-            continue
-        used = info["MemTotal"] - info["MemFree"] - info.get("FilePages", 0)
-        out[n.id] = max(0, used - in_guests.get(n.id, 0))
-    return out
+        mems.append(_numa_maps_mb(pid) if pid else _lxc_numa_mb(g.vmid))
+    return linux.host_memory_mb(nodes, mems, SYSFS)
 
 
 def read_topology() -> list[Node]:
-    nodes = []
-    for d in sorted(glob.glob(f"{SYSFS}/devices/system/node/node[0-9]*"),
-                    key=lambda p: int(p.rsplit("node", 1)[1])):
-        nid = int(d.rsplit("node", 1)[1])
-        cpus = parse_cpulist(_read(f"{d}/cpulist") or "")
-        m = re.search(r"MemTotal:\s+(\d+)\s*kB", _read(f"{d}/meminfo") or "")
-        if cpus and m:
-            threads = core.group_siblings(cpus, _siblings(cpus))
-            nodes.append(Node(nid, cpus, len(threads), int(m.group(1)) // 1024, threads))
-    return nodes
+    return linux.read_topology(SYSFS)
 
 
 # ---------------------------------------------------------------- PCI
@@ -159,10 +112,7 @@ def normalize_pci(addr: str) -> str:
 
 
 def pci_node(addr: str) -> int | None:
-    raw = _read(f"{SYSFS}/bus/pci/devices/{addr}/numa_node")
-    if raw is None or int(raw) < 0:
-        return None
-    return int(raw)
+    return linux.pci_node(addr, SYSFS)
 
 
 def resolve_mapping(name: str) -> list[str]:
@@ -543,22 +493,11 @@ def apply_one(p: Placement, g: Guest, live: bool, run=None) -> bool:
 # ---------------------------------------------------------------- état réel
 
 def _numa_maps_mb(pid: str) -> dict[int, int]:
-    per_node: dict[int, int] = {}
-    for line in (_read(f"{PROC}/{pid}/numa_maps") or "").splitlines():
-        m = re.search(r"kernelpagesize_kB=(\d+)", line)
-        page_kb = int(m.group(1)) if m else 4
-        for nid, pages in re.findall(r"\bN(\d+)=(\d+)", line):
-            per_node[int(nid)] = per_node.get(int(nid), 0) + int(pages) * page_kb
-    return {k: v // 1024 for k, v in per_node.items()}
+    return linux.numa_maps_mb(pid, PROC)
 
 
 def _lxc_numa_mb(vmid: int) -> dict[int, int]:
-    per_node: dict[int, int] = {}
-    for line in (_read(f"{SYSFS}/fs/cgroup/lxc/{vmid}/memory.numa_stat") or "").splitlines():
-        if line.split(" ", 1)[0] in ("anon", "file"):
-            for nid, size in re.findall(r"N(\d+)=(\d+)", line):
-                per_node[int(nid)] = per_node.get(int(nid), 0) + int(size)
-    return {k: v // 2**20 for k, v in per_node.items()}
+    return linux.cgroup_numa_mb(f"{SYSFS}/fs/cgroup/lxc/{vmid}/memory.numa_stat")
 
 
 def actual_state(g: Guest) -> str:

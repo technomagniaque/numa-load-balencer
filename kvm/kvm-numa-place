@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""kvm-numa-place — placement NUMA automatique des VM KVM gérées par libvirt
+(virt-manager, virsh, Cockpit) : Debian/Ubuntu, Rocky/Alma/RHEL 9-10, Fedora…
+
+  kvm-numa-place plan [--rebalance] [--cores-only] [--smt-share]
+  kvm-numa-place apply [--live] [--rebalance] [--cores-only] [--smt-share] [VM...]
+  kvm-numa-place status
+
+Règles (calcul dans numa_core.py, topologie lue dans sysfs par numa_linux.py) :
+  - VM avec <hostdev> PCI, <interface type='hostdev'> ou réseau SR-IOV -> nœud de la
+    carte, jamais quitté ; carte au nœud introuvable -> VM figée
+  - VM sans passthrough -> nœud(s) le(s) moins chargé(s), puis conservé(s)
+  - VM plus grande qu'un nœud -> plusieurs nœuds CONTIGUS
+  - SMT : jamais deux threads d'un même cœur dans une VM (--smt-share pour l'autoriser)
+  - <np:place mode="manual"/>, ou cpuset / vcpupin / numatune posés à la main -> ignorée
+
+Application, dans la définition persistante (visible dans virt-manager) :
+  <vcpu cpuset=…>                       threads autorisés (une voie SMT des nœuds choisis)
+  <numatune><memory mode nodeset=…/>    mémoire : strict, ou preferred avec ballooning
+  <metadata><np:place mode="auto"/>     marque de l'outil
+--live applique aussi à chaud : virsh vcpupin / emulatorpin, et numatune --live pour
+déplacer la RAM (sauf VM avec passthrough : RAM verrouillée par VFIO).
+
+Équilibrage sur la charge réelle : consommation CPU mesurée (--sample S secondes,
+virsh domstats) et lissée dans STATE ; une petite VM sur des nœuds saturés est évacuée
+à chaud, puis revient près de sa RAM quand la charge retombe.
+"""
+import argparse
+import os
+import re
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+
+def _import_libs():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for d in (here, os.path.dirname(here), "/usr/lib/numa-place", "/usr/local/lib/numa-place"):
+        if os.path.exists(os.path.join(d, "numa_core.py")):
+            sys.path.insert(0, d)
+            break
+
+
+_import_libs()
+import numa_core as core  # noqa: E402
+import numa_libvirt as lv  # noqa: E402
+import numa_linux as linux  # noqa: E402
+import numa_state as st  # noqa: E402
+
+URI = os.environ.get("KNP_URI", "qemu:///system")
+SYSFS = os.environ.get("KNP_SYSFS", "/sys")
+PROC = os.environ.get("KNP_PROC", "/proc")
+PIDS = os.environ.get("KNP_PID_DIR", "/run/libvirt/qemu")
+STATE = os.environ.get("KNP_STATE", "/var/lib/numa-place/kvm-state.json")
+HOST_KEY = "__host__"     # RAM de l'hôte hors VM (services, ARC ZFS…), en cache
+HOST_MAX_AGE = 300.0
+
+Vm = lv.Domain
+
+
+def log(msg: str) -> None:
+    print("kvm-numa-place: " + msg, file=sys.stderr)
+
+
+def virsh(run: linux.Runner, *args: str) -> Optional[str]:
+    return run(["virsh", "-q", "-c", URI] + list(args))
+
+
+def load_vms(run: linux.Runner = linux.run_cmd) -> List[Vm]:
+    return lv.load_domains(lambda *a: virsh(run, *a), SYSFS, exclude=())
+
+
+def qemu_pid(vm: Vm) -> Optional[str]:
+    pid = (linux.read("{}/{}.pid".format(PIDS, vm.name)) or "").strip()
+    return pid if pid and os.path.isdir("{}/{}".format(PROC, pid)) else None
+
+
+# ---------------------------------------------------------------- mesures
+
+def parse_domstats(text: str) -> Dict[str, float]:
+    """« virsh domstats --cpu-total » -> {nom: secondes CPU cumulées}."""
+    out = {}  # type: Dict[str, float]
+    name = None
+    for line in text.splitlines():
+        m = re.match(r"^Domain: '(.+)'$", line.strip())
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r"^cpu\.time=(\d+)$", line.strip())
+        if m and name is not None:
+            out[name] = int(m.group(1)) / 1e9
+    return out
+
+
+def measure_usage(run: linux.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:
+    """pCPU consommés par chaque VM pendant « seconds » secondes (0 si arrêtée)."""
+    def read_times() -> Dict[str, float]:
+        return parse_domstats(virsh(run, "domstats", "--cpu-total", "--list-active") or "")
+    used = st.measure(read_times, seconds)
+    return {vm.name: used.get(vm.name, 0.0) for vm in vms}
+
+
+def host_memory(nodes: List[core.Node], vms: List[Vm]) -> Dict[int, int]:
+    pids = [p for p in (qemu_pid(vm) for vm in vms if vm.running) if p]
+    return linux.host_memory_mb(nodes, [linux.numa_maps_mb(p, PROC) for p in pids], SYSFS)
+
+
+# ---------------------------------------------------------------- placement
+
+def to_request(vm: Vm, nodes: List[core.Node], state: Optional[st.State] = None,
+               now: float = 0.0) -> core.Request:
+    found = (linux.pci_node(a, SYSFS) for a in vm.pci)
+    cards = tuple(n for n in found if n is not None)
+    current = core.nodes_of_cpus(vm.cpuset, nodes) if vm.cpuset else ()
+    usage = st.usage(state, vm.name) if state is not None else None
+    cooling = state is not None and st.in_cooldown(state, vm.name, now)
+    home = st.home(state, vm.name, vm.domid) if state is not None else ()
+    return core.Request(vm.name, vm.vcpus, vm.guaranteed_mb, cards, current,
+                        vm.mode == "auto", lv.is_manual(vm), vm.elastic, usage, cooling, home,
+                        core.lane_of(vm.cpuset, nodes), bool(vm.pci))
+
+
+def build_plan(nodes: List[core.Node], vms: List[Vm], cores_only: bool = False,
+               rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None,
+               state: Optional[st.State] = None, now: float = 0.0,
+               spread: bool = False) -> List[Tuple[Vm, core.Placement]]:
+    reqs = [to_request(vm, nodes, state, now) for vm in vms]
+    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
+    return [(vm, placements[vm.name]) for vm in sorted(vms, key=lambda v: v.name)]
+
+
+# ---------------------------------------------------------------- application
+
+def wanted_numatune(p: core.Placement) -> Tuple[str, str]:
+    """strict quand la RAM tient (bind), preferred sinon (ballooning, nœud plein)."""
+    return ("strict" if p.policy == "bind" else "preferred", core.format_cpulist(p.node_ids))
+
+
+def apply_live(vm: Vm, p: core.Placement, run: linux.Runner) -> bool:
+    cpus = core.format_cpulist(p.cpus)
+    ok = all(virsh(run, "vcpupin", vm.name, str(i), cpus, "--live") is not None
+             for i in range(vm.vcpus))
+    ok = virsh(run, "emulatorpin", vm.name, cpus, "--live") is not None and ok
+    mode, nodeset = wanted_numatune(p)
+    if vm.pci:
+        log("{}: RAM figée par VFIO, placée au prochain démarrage".format(vm.name))
+    elif mode == "strict" and lv.numatune_of(vm) and lv.numatune_of(vm)[0] == "strict":
+        # libvirt ne déplace la RAM à chaud qu'en mode strict (cgroup cpuset.mems)
+        if virsh(run, "numatune", vm.name, "--nodeset", nodeset, "--live") is None:
+            log("{}: RAM non déplacée à chaud, placée au prochain démarrage".format(vm.name))
+    return ok
+
+
+def apply_one(vm: Vm, p: core.Placement, live: bool, run: linux.Runner = linux.run_cmd) -> bool:
+    wanted = wanted_numatune(p)
+    if vm.cpuset != p.cpus or lv.numatune_of(vm) != wanted or vm.mode != "auto":
+        if not lv.define(lambda *a: virsh(run, *a), lv.placed_xml(vm, p.cpus, wanted)):
+            return False
+        log("{}: nœud(s) {} ({}, numatune {})".format(
+            vm.name, core.format_cpulist(p.node_ids), p.reason, wanted[0]))
+    if live and vm.running:
+        return apply_live(vm, p, run)
+    return True
+
+
+# ---------------------------------------------------------------- CLI
+
+def show_plan(pairs: List[Tuple[Vm, core.Placement]], state: Optional[st.State] = None) -> None:
+    for vm, p in pairs:
+        where = "nœud {:<5} {:<9}".format(core.format_cpulist(p.node_ids), p.policy) if p.nodes else "-" * 20
+        mem = "{}-{}".format(vm.mem_min_mb, vm.mem_mb) if vm.elastic else str(vm.mem_mb)
+        used = st.usage(state, vm.name) if state is not None else None
+        cpu = "{:>5.1f}".format(used) if used is not None else "    -"
+        print("{:<24} {:>3} vCPU {} pCPU {:>11} Mo  {}  {}".format(
+            vm.name[:24], vm.vcpus, cpu, mem, where, p.reason))
+
+
+def show_status(pairs: List[Tuple[Vm, core.Placement]]) -> None:
+    for vm, _ in pairs:
+        pid = qemu_pid(vm) if vm.running else None
+        if not pid:
+            print("{:<24} arrêtée".format(vm.name[:24]))
+            continue
+        allowed = re.search(r"Cpus_allowed_list:\s*(\S+)", linux.read("{}/{}/status".format(PROC, pid)) or "")
+        ram = " ".join("N{}={}M".format(k, v) for k, v in sorted(linux.numa_maps_mb(pid, PROC).items()))
+        print("{:<24} cpus={} ram[{}]".format(vm.name[:24], allowed.group(1) if allowed else "?", ram or "?"))
+
+
+def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Placement NUMA des VM KVM (libvirt, virt-manager)")
+    ap.add_argument("cmd", choices=("plan", "apply", "status"), nargs="?", default="plan")
+    ap.add_argument("vms", nargs="*", help="noms des VM (défaut : toutes)")
+    ap.add_argument("--live", action="store_true", help="applique aussi aux VM en marche")
+    ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les VM déjà placées")
+    ap.add_argument("--cores-only", action="store_true",
+                    help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    ap.add_argument("--smt-share", action="store_true",
+                    help="autorise deux threads d'un même cœur dans une VM (défaut : jamais)")
+    ap.add_argument("--sample", type=float, default=10.0, metavar="S",
+                    help="mesure la charge CPU réelle pendant S secondes (0 : nominale)")
+    return ap.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None, run: linux.Runner = linux.run_cmd) -> int:
+    args = parse_args(argv)
+    nodes = linux.read_topology(SYSFS)
+    if len(nodes) < 2:
+        log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
+        return 0
+    vms, now = load_vms(run), time.time()
+    host, saved = st.cached(st.load(STATE), HOST_KEY, now, HOST_MAX_AGE,
+                            lambda: host_memory(nodes, vms))
+    log("hôte : " + " ".join("N{}={}M".format(k, v) for k, v in sorted(host.items())))
+    state = None
+    if args.sample > 0 and args.cmd != "status":
+        state = st.smooth(saved, measure_usage(run, vms, args.sample))
+    pairs = build_plan(nodes, vms, args.cores_only, args.rebalance, host, state, now,
+                       spread=not args.smt_share)
+    selected = [(vm, p) for vm, p in pairs if not args.vms or vm.name in args.vms]
+    if args.cmd == "plan":
+        show_plan(selected, state)
+        return 0
+    if args.cmd == "status":
+        show_status(selected)
+        return 0
+    results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
+    moves = {vm.name: (before, p.node_ids) for vm, p in selected if p.nodes and vm.cpuset
+             for before in [core.nodes_of_cpus(vm.cpuset, nodes)] if before != p.node_ids}
+    boots = {vm.name: vm.domid for vm, _ in selected}
+    st.save(STATE, st.record_moves(state if state is not None else saved, moves, boots, now))
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

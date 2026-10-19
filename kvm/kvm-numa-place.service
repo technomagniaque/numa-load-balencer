@@ -1,0 +1,12 @@
+[Unit]
+Description=Placement NUMA des VM KVM (libvirt)
+# libvirtd (Debian) ou démons modulaires virtqemud (Rocky/RHEL 9-10, Fedora)
+After=libvirtd.service virtqemud.service
+Before=libvirt-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kvm-numa-place apply --live
+
+[Install]
+WantedBy=multi-user.target
