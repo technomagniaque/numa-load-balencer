@@ -112,5 +112,56 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["h"].policy, "preferred")
 
 
+
+def xcp_ng_epyc():
+    """Topologie réelle de xcp-ng-epyc : SMT désactivé, 8 pCPU et 32 Go par nœud."""
+    return [core.Node(n, tuple(range(n * 8, n * 8 + 8)), 8, 32 * GB) for n in range(4)]
+
+
+def vm(key, vcpus, mem_gb, current, usage, **kw):
+    return req(key, vcpus, mem_gb, current=current, auto=True, **kw)._replace(usage=usage)
+
+
+class LoadBalancingTest(unittest.TestCase):
+    """La grosse VM devient active : les petites VM qui partagent ses nœuds partent."""
+
+    def test_busy_big_vm_evacuates_small_vm(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
+                                        vm("xoce", 4, 2, [1], 0.5)])
+        self.assertEqual(out["kdet1"].node_ids, (0, 1))
+        self.assertIn(out["xoce"].node_ids[0], (2, 3))
+        self.assertIn("évacuation : nœud(s) 1", out["xoce"].reason)
+
+    def test_idle_big_vm_keeps_small_vm(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 0.3),
+                                        vm("xoce", 4, 2, [1], 0.5)])
+        self.assertEqual(out["xoce"].node_ids, (1,))
+        self.assertEqual(out["xoce"].reason, "placement conservé")
+
+    def test_recently_moved_vm_stays(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
+                                        vm("xoce", 4, 2, [1], 0.5)._replace(cooldown=True)])
+        self.assertEqual(out["xoce"].node_ids, (1,))
+
+    def test_no_move_when_every_node_is_busy(self):
+        reqs = [vm("big%d" % i, 8, 8, [i], 7.5) for i in range(4)] + [vm("small", 2, 1, [1], 0.5)]
+        out = core.plan(xcp_ng_epyc(), reqs)
+        self.assertEqual(out["small"].node_ids, (1,))  # aucun nœud ne fait gagner 1 pCPU
+
+    def test_hot_vm_is_an_anchor(self):
+        out = core.plan(xcp_ng_epyc(), [vm("a", 8, 4, [1], 7.0), vm("b", 8, 4, [1], 6.0)])
+        self.assertEqual(out["a"].node_ids, (1,))
+        self.assertEqual(out["b"].node_ids, (1,))  # deux VM chaudes : on ne les bouscule pas
+
+    def test_without_measurement_nothing_moves(self):
+        out = core.plan(xcp_ng_epyc(), [req("kdet1", 16, 16, current=[0, 1], auto=True),
+                                        req("xoce", 4, 2, current=[1], auto=True)])
+        self.assertEqual(out["xoce"].node_ids, (1,))
+
+    def test_new_vms_avoid_busy_nodes(self):
+        out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
+                                        req("new", 2, 1)._replace(usage=0.0)])
+        self.assertIn(out["new"].node_ids[0], (2, 3))
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,12 +17,17 @@ du domaine et y alloue sa mémoire au démarrage suivant. --live épingle aussi 
 vCPU tout de suite (xl vcpu-pin) ; la mémoire ne bouge qu'au redémarrage de la VM.
 Ballooning (DMC) : seule la mémoire garantie (memory-dynamic-min) compte dans la
 charge des nœuds ; au-delà, Xen alloue sur le nœud de la VM tant qu'il a de la place.
+Équilibrage sur la charge réelle : à chaque passage, la consommation CPU de chaque
+VM est mesurée (--sample S secondes, xl list) puis lissée dans STATE. Une petite VM
+dont les nœuds sont saturés (ex. une grosse VM devenue active) est évacuée à chaud
+(--live) ; elle ne rebouge pas avant 10 minutes.
 Compatible Python 3.6 (dom0 XCP-ng 8.3).
 """
 import argparse
 import os
 import re
 import sys
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 
@@ -36,11 +41,13 @@ def _import_libs():
 
 _import_libs()
 import numa_core as core  # noqa: E402
+import numa_state as st  # noqa: E402
 import numa_xen as xen  # noqa: E402
 
 TAG_AUTO = "numa-auto"
 TAG_MANUAL = "numa-manual"
 INVENTORY = os.environ.get("XNP_INVENTORY", "/etc/xensource-inventory")
+STATE = os.environ.get("XNP_STATE", "/var/lib/numa-place/xcpng-state.json")
 SYSFS = os.environ.get("XNP_SYSFS", "/sys")
 
 
@@ -150,19 +157,29 @@ def is_manual(vm: Vm) -> bool:
     return TAG_MANUAL in vm.tags or (bool(vm.mask) and not is_auto(vm))
 
 
-def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> core.Request:
+def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
+               state: Optional[st.State] = None, now: float = 0.0) -> core.Request:
     found = (xen.pci_node(a, pci_nodes, SYSFS) for a in vm.pci)
     cards = tuple(n for n in found if n is not None)
     current = core.nodes_of_cpus(vm.mask, nodes) if vm.mask else ()
+    usage = st.usage(state, vm.uuid) if state is not None else None
+    cooling = state is not None and st.in_cooldown(state, vm.uuid, now)
     return core.Request(vm.uuid, vm.vcpus, vm.guaranteed_mb, cards, current,
-                        is_auto(vm), is_manual(vm), vm.elastic)
+                        is_auto(vm), is_manual(vm), vm.elastic, usage, cooling)
+
+
+def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:
+    """pCPU consommés par chaque VM pendant « seconds » secondes (0 si arrêtée)."""
+    times = st.measure(lambda: xen.domain_cpu_times(run), seconds)
+    return {vm.uuid: times.get(str(vm.domid), 0.0) if vm.domid else 0.0 for vm in vms}
 
 
 def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
                cores_only: bool = False, rebalance: bool = False,
-               reserved_mb: Optional[Dict[int, int]] = None
+               reserved_mb: Optional[Dict[int, int]] = None,
+               state: Optional[st.State] = None, now: float = 0.0
                ) -> List[Tuple[Vm, core.Placement]]:
-    reqs = [to_request(vm, nodes, pci_nodes) for vm in vms]
+    reqs = [to_request(vm, nodes, pci_nodes, state, now) for vm in vms]
     placements = core.plan(nodes, reqs, cores_only, rebalance,
                            reserved_mb)
     return [(vm, placements[vm.uuid]) for vm in sorted(vms, key=lambda v: v.name)]
@@ -188,12 +205,14 @@ def apply_one(vm: Vm, p: core.Placement, live: bool, run: xen.Runner = xen.run_c
 
 # ---------------------------------------------------------------- CLI
 
-def show_plan(pairs: List[Tuple[Vm, core.Placement]]) -> None:
+def show_plan(pairs: List[Tuple[Vm, core.Placement]], state: Optional[st.State] = None) -> None:
     for vm, p in pairs:
         where = "nœud {:<5}".format(core.format_cpulist(p.node_ids)) if p.nodes else "-" * 10
         mem = "{}-{}".format(vm.mem_min_mb, vm.mem_mb) if vm.elastic else str(vm.mem_mb)
-        print("{:<24} {:>3} vCPU {:>11} Mo  {}  {}".format(
-            vm.name[:24], vm.vcpus, mem, where, p.reason))
+        used = st.usage(state, vm.uuid) if state is not None else None
+        cpu = "{:>5.1f}".format(used) if used is not None else "    -"
+        print("{:<24} {:>3} vCPU {} pCPU {:>11} Mo  {}  {}".format(
+            vm.name[:24], vm.vcpus, cpu, mem, where, p.reason))
 
 
 def show_status(pairs: List[Tuple[Vm, core.Placement]], run: xen.Runner) -> None:
@@ -215,6 +234,8 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
     ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les VM déjà placées")
     ap.add_argument("--cores-only", action="store_true",
                     help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    ap.add_argument("--sample", type=float, default=10.0, metavar="S",
+                    help="mesure la charge CPU réelle pendant S secondes (0 : nominale)")
     args = ap.parse_args(argv)
 
     nodes, pci_nodes = xen.read_topology(run)
@@ -223,15 +244,22 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
         return 0
     dom0 = xen.dom0_memory(run)  # réservé : Xen ne déplace pas la RAM du dom0
     log("dom0 : " + xen.format_memory(dom0))
-    pairs = build_plan(nodes, pci_nodes, load_vms(run), args.cores_only, args.rebalance, dom0)
+    vms, now = load_vms(run), time.time()
+    state = None
+    if args.sample > 0 and args.cmd != "status":
+        state = st.smooth(st.load(STATE), measure_usage(run, vms, args.sample))
+    pairs = build_plan(nodes, pci_nodes, vms, args.cores_only, args.rebalance, dom0, state, now)
     selected = [(vm, p) for vm, p in pairs
                 if not args.vms or vm.name in args.vms or vm.uuid in args.vms]
     if args.cmd == "plan":
-        show_plan(selected)
+        show_plan(selected, state)
     elif args.cmd == "status":
         show_status(selected, run)
     else:
         results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
+        if state is not None:
+            moved = [vm.uuid for vm, p in selected if p.nodes and vm.mask and vm.mask != p.cpus]
+            st.save(STATE, st.mark_moved(state, moved, now))
         return 0 if all(results) else 1
     return 0
 

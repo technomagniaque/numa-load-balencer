@@ -100,6 +100,14 @@ class NumaXenTest(unittest.TestCase):
     def test_dom0_memory(self):
         self.assertEqual(xen.dom0_memory(FakeXl()), {0: 8192})
 
+    def test_domain_cpu_times(self):
+        text = ("Name                                        ID   Mem VCPUs\tState\tTime(s)\n"
+                "Domain-0                                     0  8192     8     r-----     521.0\n"
+                "Ma VM avec espaces                           7  4096     2     -b----      12.5\n")
+        run = lambda cmd: text  # noqa: E731
+        self.assertEqual(xen.domain_cpu_times(run), {"0": 521.0, "7": 12.5})
+        self.assertEqual(xen.domain_cpu_times(run, by_name=True)["Ma VM avec espaces"], 12.5)
+
     def test_old_domain_header_format(self):
         text = "Memory location of each domain:\n(XEN) Domain 7 (total: 256):\n(XEN)     Node 1: 256\n"
         self.assertEqual(xen.parse_domain_memory(text), {7: {1: 1}})
@@ -197,7 +205,7 @@ class XcpngTest(unittest.TestCase):
         from contextlib import redirect_stderr, redirect_stdout
         err, out = io.StringIO(), io.StringIO()
         with redirect_stderr(err), redirect_stdout(out):
-            self.m.main(["plan"], run=self.xe)
+            self.m.main(["plan", "--sample", "0"], run=self.xe)
         self.assertIn(["xl", "debug-keys", "u"], self.xe.calls)
         self.assertIn("dom0 : N0=8192M", err.getvalue())
         nodes, pci = xen.read_topology(self.xe)
@@ -338,3 +346,50 @@ class XenLibvirtTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BusyBigVmXe(FakeXe):
+    """Hôte XCP-ng : grosse VM (16 vCPU, nœuds 0-1) devenue active, petite VM sur le nœud 1."""
+
+    def __init__(self):
+        super().__init__()
+        self.vms = {
+            "u-big": {"name-label": "debian13kdet1", "VCPUs-max": "16", "memory-static-max": str(16 * 2**30),
+                      "other-config": "", "tags": "numa-auto", "VCPUs-params": "mask: " +
+                      ",".join(map(str, list(range(16)) + list(range(32, 48)))), "dom-id": "5"},
+            "u-small": {"name-label": "Debian13xoce", "VCPUs-max": "4", "memory-static-max": str(2 * 2**30),
+                        "other-config": "", "tags": "numa-auto", "VCPUs-params": "mask: " +
+                        ",".join(map(str, list(range(8, 16)) + list(range(40, 48)))), "dom-id": "6"},
+        }
+        self.cpu = iter([{"5": 100.0, "6": 10.0}, {"5": 175.0, "6": 12.5}])  # 15 et 0,5 pCPU sur 5 s
+
+    def __call__(self, cmd):
+        if cmd == ["xl", "list"]:
+            times = next(self.cpu)
+            rows = ["{} {} 1024 4 -b---- {}".format(n, d, times[d]) for n, d in
+                    (("debian13kdet1", "5"), ("Debian13xoce", "6"))]
+            return "Name ID Mem VCPUs State Time(s)\n" + "\n".join(rows) + "\n"
+        return super().__call__(cmd)
+
+
+class XcpngLoadBalancingTest(unittest.TestCase):
+    def test_apply_evacuates_small_vm_live_and_records_move(self):
+        from unittest import mock
+        m = load_script("xnp2", NUMA_DIR / "xcp-ng/xcpng-numa-place", {})
+        xe = BusyBigVmXe()
+        with tempfile.TemporaryDirectory() as tmp:
+            m.STATE = os.path.join(tmp, "state.json")
+            with mock.patch("time.sleep"), mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
+                rc = m.main(["apply", "--live", "--cores-only", "--sample", "5"], run=xe)
+            state = m.st.load(m.STATE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(xe.vms["u-big"]["VCPUs-params"],
+                         "mask: " + ",".join(map(str, list(range(16)) + list(range(32, 48)))))
+        small_mask = xe.vms["u-small"]["VCPUs-params"]
+        node2 = "mask: " + ",".join(map(str, list(range(16, 24)) + list(range(48, 56))))
+        node3 = "mask: " + ",".join(map(str, list(range(24, 32)) + list(range(56, 64))))
+        self.assertIn(small_mask, (node2, node3))
+        self.assertTrue(any(c[:3] == ["xl", "vcpu-pin", "6"] for c in xe.calls))
+        self.assertEqual(state["u-big"]["ema"], 15.0)
+        self.assertIn("moved", state["u-small"])
+        self.assertNotIn("moved", state["u-big"])

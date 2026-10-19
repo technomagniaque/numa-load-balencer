@@ -11,12 +11,20 @@ Règles :
   - un invité occupe le plus petit nombre de nœuds qui le contient (vCPU et RAM) ;
   - s'il en faut plusieurs, ce sont des nœuds CONTIGUS (numéros consécutifs) ;
   - avec passthrough, la fenêtre de nœuds doit contenir le nœud de la carte ;
-  - un invité déjà placé par l'outil garde sa place (sauf --rebalance) ;
+  - un invité déjà placé par l'outil garde sa place (sauf --rebalance)…
+  - … sauf une petite VM dont les nœuds sont saturés par la charge CPU RÉELLE
+    (ex. une grosse VM devenue active) : elle est évacuée vers les nœuds les moins
+    chargés, si le gain dépasse MOVE_GAIN pCPU et qu'elle n'a pas bougé récemment ;
+  - une VM « chaude » (HOT_FRACTION de ses vCPU, au moins HOT_MIN pCPU) ne bouge pas ;
   - les invités épinglés à la main ne bougent pas mais comptent dans la charge.
 """
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 MEM_FIT = 0.90  # part max de la RAM d'un nœud qu'on accepte de lier (policy bind)
+HOT_FRACTION = 0.5   # VM « chaude » : consomme au moins la moitié de ses vCPU…
+HOT_MIN = 2.0        # … et au moins 2 pCPU
+OVERLOAD = 0.85      # nœud saturé au-delà de 85 % de ses pCPU
+MOVE_GAIN = 1.0      # hystérésis : n'évacuer que si l'on gagne au moins 1 pCPU
 
 
 class Node(NamedTuple):
@@ -35,6 +43,8 @@ class Request(NamedTuple):
     auto: bool                   # déjà géré par l'outil (tag numa-auto)
     manual: bool                 # à laisser tel quel
     elastic: bool = False        # ballooning actif : la RAM peut dépasser mem_mb
+    usage: Optional[float] = None  # pCPU réellement consommés (lissés), None = inconnu
+    cooldown: bool = False       # déplacé récemment : ne pas le redéplacer tout de suite
 
 
 class Placement(NamedTuple):
@@ -90,6 +100,15 @@ def capacity(node: Node, cores_only: bool) -> int:
     return node.cores if cores_only else len(node.cpus)
 
 
+def cpu_weight(req: Request) -> float:
+    """Charge CPU d'un invité : sa consommation mesurée, sinon son nombre de vCPU."""
+    return req.usage if req.usage is not None else float(req.vcpus)
+
+
+def is_hot(req: Request) -> bool:
+    return req.usage is not None and req.usage >= max(HOT_MIN, HOT_FRACTION * req.vcpus)
+
+
 def windows(nodes: Sequence[Node], size: int) -> List[Tuple[Node, ...]]:
     ordered = sorted(nodes, key=lambda n: n.id)
     return [tuple(ordered[i:i + size]) for i in range(len(ordered) - size + 1)]
@@ -119,7 +138,7 @@ def _score(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]],
            cores_only: bool) -> float:
     k = len(win)
     return sum((load[n.id][0] + req.mem_mb / k) / n.mem_mb
-               + (load[n.id][1] + req.vcpus / k) / capacity(n, cores_only)
+               + (load[n.id][1] + cpu_weight(req) / k) / capacity(n, cores_only)
                for n in win) / k
 
 
@@ -159,15 +178,40 @@ def place_one(req: Request, nodes: Sequence[Node], load: Dict[int, List[float]],
     if req.auto and req.current and not rebalance:
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:
-            return _best(req, same, nodes, load, cores_only, "placement conservé")
+            return _keep_or_evacuate(req, same[0], cands, nodes, load, cores_only)
     return _best(req, cands, nodes, load, cores_only, "équilibrage")
+
+
+def _peak(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]],
+          cores_only: bool) -> float:
+    """Taux d'occupation CPU du nœud le plus chargé de la fenêtre, invité compris."""
+    share = cpu_weight(req) / len(win)
+    return max((load[n.id][1] + share) / capacity(n, cores_only) for n in win)
+
+
+def _keep_or_evacuate(req: Request, current: Tuple[Node, ...], cands: List[Tuple[Node, ...]],
+                      nodes: Sequence[Node], load: Dict[int, List[float]],
+                      cores_only: bool) -> Placement:
+    """Une VM déjà placée reste, sauf petite VM sur des nœuds saturés par la charge réelle."""
+    keep = _best(req, [current], nodes, load, cores_only, "placement conservé")
+    if req.usage is None or req.cooldown or is_hot(req):
+        return keep
+    before = _peak(req, current, load, cores_only)
+    if before <= OVERLOAD:
+        return keep
+    moved = _best(req, cands, nodes, load, cores_only, "évacuation")
+    gain_pcpu = (before - _peak(req, moved.nodes, load, cores_only)) * capacity(current[0], cores_only)
+    if moved.node_ids == keep.node_ids or gain_pcpu < MOVE_GAIN:
+        return keep
+    label = "évacuation : nœud(s) {} à {:.0%}".format(format_cpulist(keep.node_ids), before)
+    return moved._replace(reason=moved.reason.replace("évacuation", label, 1))
 
 
 def _add_load(load: Dict[int, List[float]], req: Request, ids: Sequence[int]) -> None:
     ids = [i for i in ids if i in load]
     for i in ids:
         load[i][0] += req.mem_mb / len(ids)
-        load[i][1] += req.vcpus / len(ids)
+        load[i][1] += cpu_weight(req) / len(ids)
 
 
 def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = False,
@@ -179,7 +223,10 @@ def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = Fals
         if r.manual and r.current:
             _add_load(load, r, r.current)
     kept = lambda r: r.auto and bool(r.current) and not rebalance  # noqa: E731
-    order = sorted(reqs, key=lambda r: (not r.pci_nodes, not kept(r), -r.vcpus, -r.mem_mb, r.key))
+    # d'abord les ancres (carte, VM chaudes), puis les plus gros consommateurs :
+    # les petites VM sont jugées contre la charge réelle déjà posée
+    order = sorted(reqs, key=lambda r: (not r.pci_nodes, not is_hot(r), not kept(r),
+                                        -cpu_weight(r), -r.vcpus, -r.mem_mb, r.key))
     out = {}  # type: Dict[str, Placement]
     for r in order:
         p = place_one(r, nodes, load, cores_only, rebalance)

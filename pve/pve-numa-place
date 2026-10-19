@@ -18,6 +18,10 @@ Ballooning (balloon: N < memory) : seuls les N Mo garantis comptent dans la char
 et la VM est en policy=preferred (un nœud plein déborde au lieu de tuer la VM).
 Les nœuds NUMA de l'invité (numaN memory=) restent dimensionnés sur « memory ».
 
+Équilibrage sur la charge réelle : consommation CPU mesurée (--sample S secondes,
+/proc/PID/stat ou cgroup cpu.stat) et lissée dans STATE ; une petite VM/CT sur des
+nœuds saturés est évacuée à chaud (--live), puis ne rebouge pas avant 10 minutes.
+
 KVM : affinity (tous les threads QEMU) + numaN hostnodes=… policy=bind|preferred
 LXC : lxc.cgroup2.cpuset.cpus / lxc.cgroup2.cpuset.mems
 """
@@ -31,6 +35,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 
@@ -45,6 +50,7 @@ def _import_core():
 
 
 core = _import_core()
+import numa_state as st  # noqa: E402  (même dossier que numa_core)
 Node, Request, Placement = core.Node, core.Request, core.Placement
 parse_cpulist, format_cpulist = core.parse_cpulist, core.format_cpulist
 
@@ -52,6 +58,7 @@ SYSFS = os.environ.get("PNP_SYSFS", "/sys")
 PROC = os.environ.get("PNP_PROC", "/proc")
 PVE = os.environ.get("PNP_PVE_DIR", "/etc/pve")
 RUN = os.environ.get("PNP_RUN_DIR", "/var/run")
+STATE = os.environ.get("PNP_STATE", "/var/lib/numa-place/pve-state.json")
 NODENAME = os.environ.get("PNP_NODENAME") or socket.gethostname().split(".")[0]
 
 TAG_AUTO = "numa-auto"
@@ -274,10 +281,33 @@ def current_nodes(g: Guest, nodes: list[Node]) -> tuple[int, ...]:
     return core.nodes_of_cpus(parse_cpulist(cpus), nodes) if cpus else ()
 
 
-def to_request(g: Guest, nodes: list[Node]) -> Request:
+def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
+               now: float = 0.0) -> Request:
     pci_nodes = tuple(n for n in (pci_node(a) for a in g.pci) if n is not None)
-    return Request(str(g.vmid), g.vcpus, g.guaranteed_mb, pci_nodes,
-                   current_nodes(g, nodes), is_auto(g), is_manual(g), g.elastic)
+    key = str(g.vmid)
+    usage = st.usage(state, key) if state is not None else None
+    cooling = state is not None and st.in_cooldown(state, key, now)
+    return Request(key, g.vcpus, g.guaranteed_mb, pci_nodes, current_nodes(g, nodes),
+                   is_auto(g), is_manual(g), g.elastic, usage, cooling)
+
+
+def cpu_seconds(g: Guest) -> float | None:
+    """Temps CPU cumulé d'un invité en marche : threads QEMU, ou cgroup du conteneur."""
+    if g.kind == "qemu":
+        pid = _qemu_pid(g.vmid)
+        fields = (_read(f"{PROC}/{pid}/stat") or "").rsplit(")", 1)[-1].split() if pid else []
+        # après « (comm) » : utime et stime sont les champs 12 et 13 (en ticks)
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK") if len(fields) > 12 else None
+    m = re.search(r"usage_usec (\d+)", _read(f"{SYSFS}/fs/cgroup/lxc/{g.vmid}/cpu.stat") or "")
+    return int(m.group(1)) / 1e6 if m else None
+
+
+def measure_usage(guests: list[Guest], seconds: float) -> dict[str, float]:
+    """pCPU consommés par chaque invité pendant « seconds » secondes (0 si arrêté)."""
+    def read() -> dict[str, float]:
+        return {str(g.vmid): s for g in guests if (s := cpu_seconds(g)) is not None}
+    used = st.measure(read, seconds)
+    return {str(g.vmid): used.get(str(g.vmid), 0.0) for g in guests}
 
 
 # ---------------------------------------------------------------- application
@@ -449,16 +479,20 @@ def actual_state(g: Guest) -> str:
 # ---------------------------------------------------------------- CLI
 
 def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
-               rebalance: bool = False) -> list[tuple[Guest, Placement]]:
-    placements = core.plan(nodes, [to_request(g, nodes) for g in guests], cores_only, rebalance)
+               rebalance: bool = False, state: st.State | None = None,
+               now: float = 0.0) -> list[tuple[Guest, Placement]]:
+    reqs = [to_request(g, nodes, state, now) for g in guests]
+    placements = core.plan(nodes, reqs, cores_only, rebalance)
     return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
 
 
-def show_plan(pairs: list[tuple[Guest, Placement]]) -> None:
+def show_plan(pairs: list[tuple[Guest, Placement]], state: st.State | None = None) -> None:
     for g, p in pairs:
         where = f"nœud {format_cpulist(p.node_ids):<5} {p.policy:<9}" if p.nodes else "-" * 21
         mem = f"{g.mem_min_mb}-{g.mem_mb}" if g.elastic else str(g.mem_mb)
-        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {mem:>11} Mo  {where}  {p.reason}")
+        used = st.usage(state, str(g.vmid)) if state is not None else None
+        cpu = f"{used:>5.1f}" if used is not None else "    -"
+        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {cpu} pCPU {mem:>11} Mo  {where}  {p.reason}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -469,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les invités déjà placés")
     ap.add_argument("--cores-only", action="store_true",
                     help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    ap.add_argument("--sample", type=float, default=10.0, metavar="S",
+                    help="mesure la charge CPU réelle pendant S secondes (0 : nominale)")
     args = ap.parse_args(argv)
 
     nodes = read_topology()
@@ -476,16 +512,24 @@ def main(argv: list[str] | None = None) -> int:
         log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
         return 0
     # le plan porte toujours sur tous les invités, pour un équilibrage cohérent
-    pairs = build_plan(nodes, load_guests(), args.cores_only, args.rebalance)
+    guests, now = load_guests(), time.time()
+    state = None
+    if args.sample > 0 and args.cmd != "status":
+        state = st.smooth(st.load(STATE), measure_usage(guests, args.sample))
+    pairs = build_plan(nodes, guests, args.cores_only, args.rebalance, state, now)
     selected = [(g, p) for g, p in pairs if not args.vmids or g.vmid in args.vmids]
     if args.cmd == "plan":
-        show_plan(selected)
+        show_plan(selected, state)
         return 0
     if args.cmd == "status":
         for g, _ in selected:
             print(f"{g.kind:<4} {g.vmid:>6}  {actual_state(g)}")
         return 0
     ok = all([apply_one(p, g, args.live) for g, p in selected if p.nodes])
+    if state is not None:
+        moved = [str(g.vmid) for g, p in selected
+                 if p.nodes and current_nodes(g, nodes) not in ((), p.node_ids)]
+        st.save(STATE, st.mark_moved(state, moved, now))
     return 0 if ok else 1
 
 

@@ -165,6 +165,29 @@ class PveTest(unittest.TestCase):
         self.assertEqual(p[100][1].policy, "bind")
         self.assertEqual(p[101][1].policy, "bind")
 
+    def test_cpu_seconds_for_qemu_and_lxc(self):
+        self.host.vm(100, "cores: 2\nmemory: 2048\n")
+        self.host.ct(200, "cores: 2\nmemory: 2048\n")
+        write(self.root / "run/qemu-server/100.pid", "4242\n")
+        stat = "4242 (kvm vm) " + " ".join(["S"] + ["0"] * 10 + ["300", "100"] + ["0"] * 5)
+        write(self.root / "proc/4242/stat", stat + "\n")
+        write(self.root / "sys/fs/cgroup/lxc/200/cpu.stat", "usage_usec 2500000\nuser_usec 1\n")
+        vm, ct = sorted(self.m.load_guests(), key=lambda g: g.vmid)
+        self.assertAlmostEqual(self.m.cpu_seconds(vm), 400 / os.sysconf("SC_CLK_TCK"))
+        self.assertEqual(self.m.cpu_seconds(ct), 2.5)
+
+    def test_busy_big_vm_evacuates_small_ct(self):
+        self.host.vm(100, "cores: 16\nmemory: 16384\ntags: numa-auto\naffinity: 0-15,32-47\n")
+        self.host.ct(101, "cores: 2\nmemory: 1024\ntags: numa-auto\n"
+                          "lxc.cgroup2.cpuset.cpus: 8-15,40-47\nlxc.cgroup2.cpuset.mems: 1\n")
+        state = {"100": {"ema": 15.0}, "101": {"ema": 0.5}}
+        busy = self.plan(cores_only=True, state=state, now=1.0)
+        self.assertEqual(busy[100][1].node_ids, (0, 1))
+        self.assertIn(busy[101][1].node_ids, ((2,), (3,)))
+        self.assertIn("évacuation", busy[101][1].reason)
+        idle = self.plan(cores_only=True, state={"100": {"ema": 0.2}, "101": {"ema": 0.5}}, now=1.0)
+        self.assertEqual(idle[101][1].node_ids, (1,))
+
     def test_manual_and_opt_out_untouched(self):
         self.host.vm(400, "cores: 2\nmemory: 2048\naffinity: 0-3\n")
         self.host.vm(401, "cores: 2\nmemory: 2048\ntags: numa-manual\n")

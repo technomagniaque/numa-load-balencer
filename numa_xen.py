@@ -111,6 +111,19 @@ def domain_memory(run: Runner = run_cmd) -> Dict[int, Dict[int, int]]:
     return parse_domain_memory(run(["xl", "dmesg"]) or "")
 
 
+def domain_cpu_times(run: Runner = run_cmd, by_name: bool = False) -> Dict[str, float]:
+    """Temps CPU cumulé (s) de chaque domaine, par domid (ou par nom), depuis « xl list »."""
+    out = {}  # type: Dict[str, float]
+    for line in (run(["xl", "list"]) or "").splitlines()[1:]:
+        parts = line.rsplit(None, 5)  # le nom peut contenir des espaces
+        if len(parts) == 6 and parts[1].isdigit():
+            try:
+                out[parts[0] if by_name else parts[1]] = float(parts[5])
+            except ValueError:
+                continue
+    return out
+
+
 def dom0_memory(run: Runner = run_cmd) -> Dict[int, int]:
     """Mémoire du dom0 par nœud (Mo), à réserver dans le calcul du placement."""
     return {n: mb for n, mb in domain_memory(run).get(0, {}).items() if mb}

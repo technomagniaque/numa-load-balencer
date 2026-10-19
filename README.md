@@ -12,11 +12,19 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 - `--cores-only` : un nœud contient ses cœurs physiques (8), pas ses threads (16) ;
   une VM à 16 vCPU prend alors 2 nœuds contigus ;
 - invités épinglés à la main, ou marqués `numa-manual` → non modifiés, mais comptés dans la charge.
+- **équilibrage sur la charge réelle** : à chaque passage (toutes les 2 min), la consommation CPU
+  de chaque invité est mesurée (`--sample 10` s) et lissée dans `/var/lib/numa-place/*-state.json`.
+  Une VM « chaude » (≥ 50 % de ses vCPU et ≥ 2 pCPU) garde ses nœuds ; une petite VM dont les nœuds
+  dépassent 85 % est **évacuée à chaud** vers les nœuds les moins chargés, si le gain dépasse 1 pCPU,
+  puis ne rebouge pas pendant 10 min. `--sample 0` revient au calcul sur les vCPU nominaux.
+- **ballooning** : seule la mémoire garantie compte (`memory-dynamic-min`, `<currentMemory>`,
+  `balloon:`) ; une VM à ballooning n'est jamais liée strictement (`policy=preferred`).
 
 | Fichier | Rôle | Python |
 |---|---|---|
 | `numa_core.py` | calcul du placement, commun aux trois outils | 3.6+ |
 | `numa_xen.py` | topologie et nœud des cartes PCI via `xl info -n` | 3.6+ |
+| `numa_state.py` | consommation lissée et délai après déplacement (fichier d'état) | 3.6+ |
 | `pve/pve-numa-place` | Proxmox VE 8/9 : KVM (`affinity`, `numaN hostnodes`) et LXC (`cpuset`) | 3.9+ |
 | `xcp-ng/xcpng-numa-place` | XCP-ng 8.3 : `VCPUs-params:mask` + tag `numa-auto` | 3.6+ |
 | `xen-libvirt/xen-numa-place` | Debian 13 dom0 + libvirt (libxl) : `<vcpu cpuset>` + `<metadata>` | 3.6+ |
@@ -26,7 +34,7 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 Copier le dossier `numa/` sur l'hôte, puis, selon la plateforme (`pve`, `xcp-ng` ou `xen-libvirt`) :
 
 ```bash
-install -d /usr/local/lib/numa-place && install -m644 numa_core.py numa_xen.py /usr/local/lib/numa-place/
+install -d /usr/local/lib/numa-place && install -m644 numa_core.py numa_state.py numa_xen.py /usr/local/lib/numa-place/
 ```
 
 ```bash
