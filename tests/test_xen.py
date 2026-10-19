@@ -25,7 +25,7 @@ def xl_info_n() -> str:
         lines.append("{:3d}:   {:5d}   {:6d}   {:6d}".format(c, c % 32, 0, node))
     lines += ["device topology        :", "device           node",
               "0000:00:00.0      0", "0000:22:00.4      1", "0000:43:00.0      2",
-              "0000:63:00.0      3", "0000:64:00.0      -",
+              "0000:63:00.0      3", "0000:64:00.0      -", "0000:41:00.0      2",
               "numa_info              :", "node:    memsize    memfree    distances"]
     for n in range(4):
         lines.append("   {}:     32768      30000      10,16,16,16".format(n))
@@ -41,6 +41,15 @@ DMESG = """(XEN) 'u' pressed -> dumping numa info (now = 1)
 (XEN)     Node 2: 4194304
 (XEN)     Node 3: 0
 """
+
+
+def make_vf(sysfs: Path, vf: str, pf: str = "0000:41:00.0") -> None:
+    """Crée /sys/bus/pci/devices/<vf>/physfn -> <pf>, comme le noyau pour une VF SR-IOV."""
+    pf_dir = sysfs / "devices/pci0000:40/0000:40:03.1" / pf
+    pf_dir.mkdir(parents=True, exist_ok=True)
+    vf_dir = sysfs / "bus/pci/devices" / vf
+    vf_dir.mkdir(parents=True)
+    (vf_dir / "physfn").symlink_to(pf_dir)
 
 
 class FakeXl:
@@ -80,6 +89,14 @@ class NumaXenTest(unittest.TestCase):
         self.assertEqual(pci["0000:61:00.0"], 3)  # Tesla P40
         self.assertEqual(len(pci), 118)
 
+    def test_pci_node_falls_back_to_pf_for_vf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_vf(Path(tmp), "0000:41:01.0")
+            pci = {"0000:41:00.0": 2, "0000:43:00.0": 3}
+            self.assertEqual(xen.pci_node("0000:43:00.0", pci, tmp), 3)
+            self.assertEqual(xen.pci_node("0000:41:01.0", pci, tmp), 2)
+            self.assertIsNone(xen.pci_node("0000:99:00.0", pci, tmp))
+
     def test_old_domain_header_format(self):
         text = "Memory location of each domain:\n(XEN) Domain 7 (total: 256):\n(XEN)     Node 1: 256\n"
         self.assertEqual(xen.parse_domain_memory(text), {7: {1: 1}})
@@ -98,6 +115,9 @@ class FakeXe(FakeXl):
                       "other-config": "", "tags": "", "VCPUs-params": "", "dom-id": "-1"},
             "u-man": {"name-label": "manuelle", "VCPUs-max": "2", "memory-static-max": str(2**30),
                       "other-config": "", "tags": "", "VCPUs-params": "mask: 0,1", "dom-id": "-1"},
+            "u-vf": {"name-label": "debian13vf", "VCPUs-max": "2", "memory-static-max": str(2**30),
+                     "other-config": "pci: 0/0000:41:01.2", "tags": "", "VCPUs-params": "",
+                     "dom-id": "-1"},
             "u-big": {"name-label": "grosse", "VCPUs-max": "24", "memory-static-max": str(8 * 2**30),
                       "other-config": "", "tags": "", "VCPUs-params": "", "dom-id": "-1"},
         }
@@ -126,8 +146,14 @@ class FakeXe(FakeXl):
 
 class XcpngTest(unittest.TestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        make_vf(Path(self.tmp.name), "0000:41:01.2")
         self.m = load_script("xnp", NUMA_DIR / "xcp-ng/xcpng-numa-place", {})
+        self.m.SYSFS = self.tmp.name
         self.xe = FakeXe()
+
+    def tearDown(self):
+        self.tmp.cleanup()
 
     def plan(self, **kw):
         nodes, pci = xen.read_topology(self.xe)
@@ -140,6 +166,7 @@ class XcpngTest(unittest.TestCase):
         self.assertEqual(p["manuelle"][1].nodes, ())
         self.assertEqual(self.plan()["grosse"][1].node_ids, (0, 1))  # 24 vCPU / 16 threads
         self.assertEqual(len(p["debian13kdet1"][1].node_ids), 1)
+        self.assertEqual(p["debian13vf"][1].node_ids, (2,))  # VF -> physfn -> PF0, nœud 2
 
     def test_apply_sets_mask_tag_and_live_pin_then_idempotent(self):
         for vm, p in self.plan().values():
@@ -184,10 +211,23 @@ DOMAIN_MAN = """<domain type='xen'><name>man</name><memory unit='MiB'>1024</memo
 <vcpu cpuset='0-1'>2</vcpu></domain>"""
 
 
+DOMAIN_DB = """<domain type='xen'><name>db</name><memory unit='GiB'>2</memory><vcpu>2</vcpu>
+<devices><interface type='network'><source network='chelsio-pool'/></interface>
+<interface type='network'><source network='default'/></interface></devices></domain>"""
+
+
 class FakeVirsh(FakeXl):
     def __init__(self, sysfs: Path):
         super().__init__()
-        self.defs = {"ia": DOMAIN_IA, "web": DOMAIN_WEB, "man": DOMAIN_MAN}
+        self.defs = {"ia": DOMAIN_IA, "web": DOMAIN_WEB, "man": DOMAIN_MAN, "db": DOMAIN_DB}
+        self.nets = {
+            "chelsio-vf": "<network><forward mode='hostdev'><pf dev='enp34s0f4'/></forward></network>",
+            "chelsio-pool": "<network><forward mode='hostdev' managed='yes'>"
+                            "<address type='pci' domain='0x0000' bus='0x41' slot='0x01' function='0x0'/>"
+                            "<address type='pci' domain='0x0000' bus='0x41' slot='0x01' function='0x1'/>"
+                            "</forward></network>",
+            "default": "<network><forward mode='nat'/></network>",
+        }
         self.sysfs = sysfs
 
     def __call__(self, cmd):
@@ -202,7 +242,7 @@ class FakeVirsh(FakeXl):
         if args[0] == "domid":
             return "5\n" if args[1] == "ia" else "-\n"
         if args[0] == "net-dumpxml":
-            return "<network><forward mode='hostdev'><pf dev='enp34s0f4'/></forward></network>"
+            return self.nets.get(args[1])
         if args[0] == "define":
             text = Path(args[1]).read_text()
             self.defs[ET.fromstring(text).findtext("name")] = text
@@ -219,6 +259,7 @@ class XenLibvirtTest(unittest.TestCase):
         net = sysfs / "class/net/enp34s0f4"
         net.mkdir(parents=True)
         (net / "device").symlink_to(dev)
+        make_vf(sysfs, "0000:41:01.0")
         self.m = load_script("xlp", NUMA_DIR / "xen-libvirt/xen-numa-place", {"XNP_SYSFS": str(sysfs)})
         self.m.SYSFS = str(sysfs)
         self.virsh = FakeVirsh(sysfs)
@@ -236,6 +277,12 @@ class XenLibvirtTest(unittest.TestCase):
         self.assertEqual(p["ia"][1].node_ids, (2,))
         self.assertEqual(p["web"][1].node_ids, (1,))
         self.assertEqual(p["man"][1].nodes, ())
+
+    def test_vf_pool_listed_by_address_uses_pf_node(self):
+        p = self.plan()
+        self.assertEqual(p["db"][0].pci, ("0000:41:01.0",))  # réseau NAT ignoré
+        self.assertEqual(p["db"][1].node_ids, (2,))
+        self.assertIn("passthrough", p["db"][1].reason)
 
     def test_apply_writes_cpuset_and_marker_then_idempotent(self):
         for vm, p in self.plan(cores_only=True).values():

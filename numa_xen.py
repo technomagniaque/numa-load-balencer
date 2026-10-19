@@ -5,6 +5,7 @@ Le dom0 est PV : Linux n'y voit pas la topologie NUMA (numa_node = -1 partout).
 On la demande donc à l'hyperviseur, avec « xl info -n », qui donne aussi le nœud
 de chaque périphérique PCI (section « device topology »). Compatible Python 3.6.
 """
+import os
 import re
 import subprocess
 import sys
@@ -67,6 +68,17 @@ def parse_xl_info(text: str) -> Tuple[List[core.Node], Dict[str, int]]:
         if m:
             pci[m.group(1).lower()] = int(m.group(2))
     return nodes, pci
+
+
+def pci_node(addr: str, pci_nodes: Dict[str, int], sysfs: str = "/sys") -> Optional[int]:
+    """Nœud d'une carte ; pour une VF SR-IOV absente de la topologie Xen
+    (créée après le démarrage), celui de sa PF via le lien sysfs « physfn »."""
+    if addr in pci_nodes:
+        return pci_nodes[addr]
+    physfn = os.path.join(sysfs, "bus/pci/devices", addr, "physfn")
+    if os.path.exists(physfn):
+        return pci_nodes.get(os.path.basename(os.path.realpath(physfn)))
+    return None
 
 
 def read_topology(run: Runner = run_cmd) -> Tuple[List[core.Node], Dict[str, int]]:

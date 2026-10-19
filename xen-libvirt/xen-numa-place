@@ -70,12 +70,22 @@ def _pci_addr(addr: ET.Element) -> str:
     return "{:04x}:{:02x}:{:02x}.{:x}".format(*vals)
 
 
-def _pf_addr(run: xen.Runner, network: str) -> Optional[str]:
-    """PF d'un réseau libvirt <forward mode='hostdev'> -> adresse PCI."""
+def _pool_addr(run: xen.Runner, network: str) -> Optional[str]:
+    """Carte d'un réseau libvirt <forward mode='hostdev'> -> adresse PCI.
+
+    Le pool peut lister ses VF (<address …/>, seule forme qui marche avec une
+    Chelsio, dont les VF sont sous les PF 0-3) ou nommer la PF (<pf dev=…/>).
+    La VM reçoit une VF quelconque du pool : la première sert de référence."""
     text = virsh(run, "net-dumpxml", network)
     if not text:
         return None
-    pf = ET.fromstring(text).find("./forward[@mode='hostdev']/pf")
+    forward = ET.fromstring(text).find("./forward[@mode='hostdev']")
+    if forward is None:
+        return None
+    vf = forward.find("address[@type='pci']")
+    if vf is not None:
+        return _pci_addr(vf)
+    pf = forward.find("pf")
     if pf is None or not pf.get("dev"):
         return None
     real = os.path.realpath(os.path.join(SYSFS, "class/net", pf.get("dev"), "device"))
@@ -86,9 +96,9 @@ def pci_of(root: ET.Element, run: xen.Runner) -> Tuple[str, ...]:
     addrs = [_pci_addr(a) for a in root.findall("./devices/hostdev[@type='pci']/source/address")]
     addrs += [_pci_addr(a) for a in root.findall("./devices/interface[@type='hostdev']/source/address")]
     for src in root.findall("./devices/interface[@type='network']/source"):
-        pf = _pf_addr(run, src.get("network", ""))
-        if pf and pf not in addrs:
-            addrs.append(pf)
+        card = _pool_addr(run, src.get("network", ""))
+        if card and card not in addrs:
+            addrs.append(card)
     return tuple(addrs)
 
 
@@ -123,7 +133,8 @@ def is_manual(vm: Vm) -> bool:
 
 
 def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> core.Request:
-    cards = tuple(pci_nodes[a] for a in vm.pci if a in pci_nodes)
+    found = (xen.pci_node(a, pci_nodes, SYSFS) for a in vm.pci)
+    cards = tuple(n for n in found if n is not None)
     current = core.nodes_of_cpus(vm.cpuset, nodes) if vm.cpuset else ()
     return core.Request(vm.name, vm.vcpus, vm.mem_mb, cards, current, vm.mode == "auto", is_manual(vm))
 

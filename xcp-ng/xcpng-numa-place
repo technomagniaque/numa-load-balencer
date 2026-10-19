@@ -39,6 +39,7 @@ import numa_xen as xen  # noqa: E402
 TAG_AUTO = "numa-auto"
 TAG_MANUAL = "numa-manual"
 INVENTORY = os.environ.get("XNP_INVENTORY", "/etc/xensource-inventory")
+SYSFS = os.environ.get("XNP_SYSFS", "/sys")
 
 
 def log(msg: str) -> None:
@@ -137,7 +138,8 @@ def is_manual(vm: Vm) -> bool:
 
 
 def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int]) -> core.Request:
-    cards = tuple(pci_nodes[a] for a in vm.pci if a in pci_nodes)
+    found = (xen.pci_node(a, pci_nodes, SYSFS) for a in vm.pci)
+    cards = tuple(n for n in found if n is not None)
     current = core.nodes_of_cpus(vm.mask, nodes) if vm.mask else ()
     return core.Request(vm.uuid, vm.vcpus, vm.mem_mb, cards, current, is_auto(vm), is_manual(vm))
 

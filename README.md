@@ -68,6 +68,11 @@ pve-numa-place status
   Sur XCP-ng, si la politique NUMA de l'hôte est `best_effort`, vérifier avec `status` que la RAM
   est bien sur les nœuds du mask.
 - Xen : le dom0 PV ne voit pas NUMA (`numa_node = -1`) ; le nœud des cartes vient de `xl info -n`.
+  Une VF SR-IOV créée après le démarrage n'y figure pas : son nœud est celui de sa PF (lien sysfs `physfn`).
+- Chelsio T6 : les VF sont sous les PF 0-3 (`41:00.0`…), pas sous la PF4 qui porte le réseau.
+  Un pool libvirt `<forward mode='hostdev'><pf dev=…/>` ne les trouve donc pas : lister les VF
+  par `<address type='pci' …/>` dans le pool (lu par `xen-numa-place`).
+- Passthrough et SR-IOV (Xen 4.17 à 4.21) : invité HVM ou PV seulement, pas PVH ; dom0 PV obligatoire.
 
 ## Tests
 
