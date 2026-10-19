@@ -184,6 +184,24 @@ class LoadBalancingTest(unittest.TestCase):
                                         vm("xoce", 4, 2, [2], 0.5, home=(1,), cooldown=True)])
         self.assertEqual(out["xoce"].node_ids, (2,))
 
+    def test_passthrough_vm_never_leaves_its_card_node(self):
+        for rebalance in (False, True):
+            out = core.plan(xcp_ng_epyc(), [vm("big", 8, 8, [3], 7.9),
+                                            vm("gpu", 4, 8, [3], 0.3, pci=[3])], rebalance=rebalance)
+            self.assertEqual(out["gpu"].node_ids, (3,), rebalance)
+
+    def test_passthrough_vm_with_unknown_card_node_is_frozen(self):
+        frozen = vm("vf", 4, 2, [1], 0.5)._replace(passthrough=True)
+        for rebalance in (False, True):
+            out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0), frozen],
+                            rebalance=rebalance)
+            self.assertEqual(out["vf"].node_ids, (1,), rebalance)
+            self.assertIn("figé", out["vf"].reason)
+
+    def test_passthrough_vm_is_not_brought_back_elsewhere(self):
+        out = core.plan(xcp_ng_epyc(), [vm("gpu", 4, 8, [3], 0.3, pci=[3], home=(1,))])
+        self.assertEqual(out["gpu"].node_ids, (3,))   # le nœud de la carte prime sur l'origine
+
     def test_new_vms_avoid_busy_nodes(self):
         out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
                                         req("new", 2, 1)._replace(usage=0.0)])

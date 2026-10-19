@@ -269,6 +269,16 @@ class PveTest(unittest.TestCase):
             self.assertEqual(len(cores), len(p.cpus), g.vmid)   # jamais deux frères
             self.assertEqual(len(p.cpus), 8)
 
+    def test_unresolved_mapping_still_freezes_the_vm(self):
+        self.host.vm(100, "cores: 4\nmemory: 4096\nhostpci0: mapping=absente,pcie=1\n"
+                          "tags: numa-auto\naffinity: 8-15,40-47\n")
+        g, p = self.plan()[100]
+        self.assertEqual(g.pci, ())                       # carte introuvable sur ce nœud…
+        self.assertTrue(self.m.has_passthrough(g))        # … mais le passthrough est vu
+        busy = self.plan(state={"100": {"ema": 0.2}}, now=1.0, rebalance=True)
+        self.assertEqual(busy[100][1].node_ids, (1,))
+        self.assertIn("figé", busy[100][1].reason)
+
     def test_manual_and_opt_out_untouched(self):
         self.host.vm(400, "cores: 2\nmemory: 2048\naffinity: 0-3\n")
         self.host.vm(401, "cores: 2\nmemory: 2048\ntags: numa-manual\n")

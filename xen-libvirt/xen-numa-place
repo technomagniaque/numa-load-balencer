@@ -170,7 +170,7 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
     home = st.home(state, vm.name, vm.domid) if state is not None else ()
     return core.Request(vm.name, vm.vcpus, vm.guaranteed_mb, cards, current,
                         vm.mode == "auto", is_manual(vm), vm.elastic, usage, cooling, home,
-                        core.lane_of(vm.cpuset, nodes))
+                        core.lane_of(vm.cpuset, nodes), bool(vm.pci))
 
 
 def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:

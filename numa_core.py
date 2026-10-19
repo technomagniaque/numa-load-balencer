@@ -10,7 +10,9 @@ strictement (policy preferred) : s'il regonfle sur un nœud plein, il déborde.
 Règles :
   - un invité occupe le plus petit nombre de nœuds qui le contient (vCPU et RAM) ;
   - s'il en faut plusieurs, ce sont des nœuds CONTIGUS (numéros consécutifs) ;
-  - avec passthrough, la fenêtre de nœuds doit contenir le nœud de la carte ;
+  - avec passthrough, la fenêtre de nœuds contient TOUJOURS le nœud de la carte : une
+    telle VM n'est jamais évacuée ni rééquilibrée hors de ce nœud ; si le nœud de la
+    carte est introuvable, la VM garde ses nœuds actuels ;
   - un invité déjà placé par l'outil garde sa place (sauf --rebalance)…
   - … sauf une petite VM dont les nœuds sont saturés par la charge CPU RÉELLE
     (ex. une grosse VM devenue active) : elle est évacuée vers les nœuds les moins
@@ -58,6 +60,7 @@ class Request(NamedTuple):
     cooldown: bool = False       # déplacé récemment : ne pas le redéplacer tout de suite
     home: Tuple[int, ...] = ()   # nœud(s) où se trouve sa RAM après une évacuation
     lane: int = -1               # voie SMT actuelle (-1 : nœuds entiers ou inconnue)
+    passthrough: bool = False    # a un périphérique PCI (GPU, VF…), même si son nœud est inconnu
 
 
 class Placement(NamedTuple):
@@ -284,6 +287,11 @@ def place_one(req: Request, nodes: Sequence[Node], load: Optional[_Ctx] = None,
         most = max(len(set(pci) & {n.id for n in w}) for w in with_card)
         best = [w for w in with_card if len(set(pci) & {n.id for n in w}) == most]
         return _best(req, best, ctx, "passthrough nœud {}".format(pci[0]), req.lane)
+    if req.passthrough and req.current:
+        # carte présente mais nœud introuvable : on ne devine pas, la VM ne bouge jamais
+        same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
+        if same:
+            return _best(req, same, ctx, "passthrough (nœud de la carte inconnu) : figé", req.lane)
     if req.auto and req.current and not rebalance:
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:

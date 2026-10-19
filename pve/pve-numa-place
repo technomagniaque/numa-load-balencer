@@ -361,7 +361,18 @@ def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
     home = st.home(state, key, boot_id(g)) if state is not None else ()
     return Request(key, g.vcpus, g.guaranteed_mb, pci_nodes, current_nodes(g, nodes),
                    is_auto(g), is_manual(g), g.elastic, usage, cooling, home,
-                   core.lane_of(current_cpus(g), nodes))
+                   core.lane_of(current_cpus(g), nodes), has_passthrough(g))
+
+
+def has_passthrough(g: Guest) -> bool:
+    """Périphérique passé à l'invité, même si sa carte n'a pas pu être résolue
+    (mapping absent sur ce nœud, sysfs incomplet) : un tel invité ne doit jamais bouger."""
+    if g.pci:
+        return True
+    if g.kind == "qemu":
+        return any(re.fullmatch(r"hostpci\d+", k) for k in g.conf)
+    return any(re.search(r"/dev/(?:dri/|nvidia\d)", v) for k, vals in g.conf.items()
+               if re.fullmatch(r"dev\d+", k) or k == "lxc.mount.entry" for v in vals)
 
 
 def current_cpus(g: Guest) -> tuple[int, ...]:

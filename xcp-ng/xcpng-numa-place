@@ -167,7 +167,7 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
     home = st.home(state, vm.uuid, boot_id(vm)) if state is not None else ()
     return core.Request(vm.uuid, vm.vcpus, vm.guaranteed_mb, cards, current,
                         is_auto(vm), is_manual(vm), vm.elastic, usage, cooling, home,
-                        core.lane_of(vm.mask, nodes))
+                        core.lane_of(vm.mask, nodes), bool(vm.pci))
 
 
 def boot_id(vm: Vm) -> str:
