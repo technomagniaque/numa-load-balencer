@@ -8,11 +8,11 @@ Produit (Architecture: all, Debian 13 / Proxmox VE 8-9) :
   pve-numa-place     outil Proxmox (KVM + LXC) + timer systemd
   xen-numa-place     outil Xen + libvirt (dom0 Debian 13) + numa_xen.py + timer
 
-Un .deb est une archive « ar » : debian-binary, control.tar, data.tar.
+Un .deb est une archive « ar » : debian-binary, control.tar.gz, data.tar.gz.
 Ce script l'écrit lui-même, avec des fichiers root:root et des dates fixes
-(SOURCE_DATE_EPOCH). Les tar ne sont PAS compressés (dpkg l'accepte) : la sortie
-de gzip dépend de la bibliothèque (zlib, zlib-ng…), alors qu'un tar non compressé
-est identique partout. Même commit -> mêmes .deb au bit près, sur toute machine.
+(SOURCE_DATE_EPOCH). Le gzip est écrit à la main en blocs « stockés » : la sortie
+d'un vrai compresseur dépend de la bibliothèque (zlib, zlib-ng…), celle-ci non.
+Même commit -> mêmes .deb au bit près, sur toute machine (vérifié CI / CachyOS).
 Les timers sont installés mais PAS activés : appliquer un placement modifie
 les VM, c'est à l'administrateur de le décider (systemctl enable --now …).
 """
@@ -172,7 +172,7 @@ def _tar(entries: List[Tuple[tarfile.TarInfo, bytes]], mtime: int) -> bytes:
 
 def stored_gzip(data: bytes, mtime: int) -> bytes:
     """gzip sans compression (blocs deflate « stockés ») : octets identiques quelle que
-    soit la bibliothèque zlib. Sert au changelog.Debian.gz exigé par la charte Debian."""
+    soit la bibliothèque zlib. Sert aux tar du paquet et au changelog."""
     out = [b"\x1f\x8b\x08\x00" + struct.pack("<I", mtime) + b"\x00\x03"]
     chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
     for i, chunk in enumerate(chunks):
@@ -185,10 +185,11 @@ def stored_gzip(data: bytes, mtime: int) -> bytes:
 def changelog(pkg: Package, version: str, mtime: int) -> File:
     date = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(mtime))
     text = ("{name} ({v}) unstable; urgency=medium\n\n"
-            "  * numa-load-balencer {v} : {home}/releases\n\n"
+            "  * Release {v}, see the GitHub releases page.\n\n"
             " -- {who}  {date}\n").format(name=pkg.name, v=version, home=HOMEPAGE,
                                             who=MAINTAINER, date=date)
-    return File("usr/share/doc/{}/changelog.Debian.gz".format(pkg.name),
+    # paquet « natif » (version sans révision Debian) : changelog.gz, pas changelog.Debian.gz
+    return File("usr/share/doc/{}/changelog.gz".format(pkg.name),
                 stored_gzip(text.encode(), mtime))
 
 
@@ -251,8 +252,8 @@ def ar_archive(members: List[Tuple[str, bytes]], mtime: int) -> bytes:
 def build(pkg: Package, version: str, out_dir: str, mtime: int) -> str:
     pkg = pkg._replace(files=pkg.files + (changelog(pkg, version, mtime),))
     deb = ar_archive([("debian-binary", b"2.0\n"),
-                      ("control.tar", control_tar(pkg, version, mtime)),
-                      ("data.tar", data_tar(pkg, mtime))], mtime)
+                      ("control.tar.gz", stored_gzip(control_tar(pkg, version, mtime), mtime)),
+                      ("data.tar.gz", stored_gzip(data_tar(pkg, mtime), mtime))], mtime)
     path = os.path.join(out_dir, "{}_{}_all.deb".format(pkg.name, version))
     with open(path, "wb") as fh:
         fh.write(deb)

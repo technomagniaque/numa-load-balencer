@@ -74,7 +74,7 @@ apt install ./numa-place-common_*_all.deb ./pve-numa-place_*_all.deb
 (Debian 13 : tests, construction, `dpkg-deb`/`lintian`, essai d'installation) et publie la
 Release `numa-place X.Y.Z` avec les trois `.deb` et `SHA256SUMS`.
 Construction locale, sans dpkg. Même commit → mêmes `.deb` au bit près, quelle que soit la machine
-(tar non compressés : la sortie de gzip varie selon zlib / zlib-ng). Vérifier une Release :
+(gzip écrit en blocs « stockés » : la sortie d'un vrai compresseur varie selon zlib / zlib-ng). Vérifier une Release :
 
 ```bash
 python3 packaging/build_deb.py --out dist
