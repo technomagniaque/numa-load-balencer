@@ -19,6 +19,13 @@ Règles :
     sur le nœud où se trouve sa RAM (Xen ne déplace pas la mémoire à chaud) ;
   - une VM « chaude » (HOT_FRACTION de ses vCPU, au moins HOT_MIN pCPU) ne bouge pas ;
   - les invités épinglés à la main ne bougent pas mais comptent dans la charge.
+
+SMT (mode « spread », par défaut dans les outils) : quelle que soit la largeur SMT
+(1, 2, 4, 8, ou mélange de cœurs P/E), les threads d'un même cœur physique ne vont
+JAMAIS à la même VM. Chaque nœud est découpé en « voies » : la voie j réunit le
+j-ième thread de chaque cœur ; une VM reçoit une seule voie, donc au plus un thread
+par cœur, et ses vCPU ne se disputent jamais un cœur. Sans SMT il n'y a qu'une voie :
+le comportement est celui d'un placement par nœud entier.
 """
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -35,6 +42,7 @@ class Node(NamedTuple):
     cpus: Tuple[int, ...]
     cores: int       # cœurs physiques (threads SMT regroupés)
     mem_mb: int
+    threads: Tuple[Tuple[int, ...], ...] = ()  # frères SMT de chaque cœur ; () = 1 thread/cœur
 
 
 class Request(NamedTuple):
@@ -49,6 +57,7 @@ class Request(NamedTuple):
     usage: Optional[float] = None  # pCPU réellement consommés (lissés), None = inconnu
     cooldown: bool = False       # déplacé récemment : ne pas le redéplacer tout de suite
     home: Tuple[int, ...] = ()   # nœud(s) où se trouve sa RAM après une évacuation
+    lane: int = -1               # voie SMT actuelle (-1 : nœuds entiers ou inconnue)
 
 
 class Placement(NamedTuple):
@@ -56,6 +65,7 @@ class Placement(NamedTuple):
     nodes: Tuple[Node, ...]      # () : invité non placé
     policy: str                  # "bind" | "preferred" | ""
     reason: str
+    lane: int = -1               # voie SMT attribuée (-1 : tous les threads des nœuds)
 
     @property
     def node_ids(self) -> Tuple[int, ...]:
@@ -63,7 +73,55 @@ class Placement(NamedTuple):
 
     @property
     def cpus(self) -> Tuple[int, ...]:
-        return tuple(sorted(c for n in self.nodes for c in n.cpus))
+        if self.lane < 0:
+            return tuple(sorted(c for n in self.nodes for c in n.cpus))
+        return tuple(sorted(c for n in self.nodes for c in lane_cpus(n, self.lane)))
+
+
+# ------------------------------------------------------------------ topologie SMT
+
+def group_siblings(cpus: Iterable[int], siblings: Dict[int, Iterable[int]]) -> Tuple[Tuple[int, ...], ...]:
+    """Regroupe les CPU d'un nœud par cœur physique.
+
+    siblings[c] = CPU qui partagent le cœur de c (c compris), tels que donnés par le
+    noyau (core_cpus_list / thread_siblings_list) ou par Xen ; marche pour SMT1 à SMT8,
+    ARM, x86 et cœurs hybrides. Un CPU sans information forme un cœur à lui seul."""
+    mine = set(cpus)
+    groups = set()
+    for c in mine:
+        groups.add(tuple(sorted(set(siblings.get(c, (c,))) & mine | {c})))
+    return tuple(sorted(groups))
+
+
+def lanes(node: Node) -> Tuple[Tuple[int, ...], ...]:
+    """Voies SMT du nœud : la voie j réunit le j-ième thread de chaque cœur."""
+    if not node.threads:
+        return (node.cpus,)
+    width = max(len(core) for core in node.threads)
+    return tuple(tuple(sorted(core[j] for core in node.threads if len(core) > j))
+                 for j in range(width))
+
+
+def smt_width(node: Node) -> int:
+    return len(lanes(node))
+
+
+def lane_cpus(node: Node, lane: int) -> Tuple[int, ...]:
+    all_lanes = lanes(node)
+    return all_lanes[lane % len(all_lanes)]
+
+
+def lane_of(cpus: Iterable[int], nodes: Sequence[Node]) -> int:
+    """Voie SMT correspondant exactement à un masque, -1 si ce n'est pas une voie."""
+    wanted = set(cpus)
+    mine = [n for n in nodes if wanted & set(n.cpus)]
+    if not mine or max(smt_width(n) for n in mine) <= 1:
+        return -1
+    for j in range(max(smt_width(n) for n in mine)):
+        if wanted == {c for n in mine for c in lane_cpus(n, j)}:
+            return j
+    return -1
+
 
 
 # ------------------------------------------------------------------ listes de CPU
@@ -100,6 +158,27 @@ def nodes_of_cpus(cpus: Iterable[int], nodes: Sequence[Node]) -> Tuple[int, ...]
 
 # ------------------------------------------------------------------ placement
 
+class _Ctx(object):
+    """Topologie, charge courante et options d'un calcul de placement.
+
+    load[nid] = [Mo de RAM, pCPU sur le nœud, [pCPU par voie SMT]]"""
+
+    def __init__(self, nodes: Sequence[Node], cores_only: bool, spread: bool,
+                 reserved_mb: Optional[Dict[int, int]]) -> None:
+        self.nodes = list(nodes)
+        self.cores_only = cores_only
+        self.spread = spread and any(smt_width(n) > 1 for n in nodes)
+        self.load = {n.id: [float((reserved_mb or {}).get(n.id, 0)), 0.0, [0.0] * smt_width(n)]
+                     for n in nodes}  # type: Dict[int, list]
+
+    def fit_capacity(self, node: Node) -> int:
+        """vCPU qu'un nœud peut accueillir pour UNE VM (une voie = un thread par cœur)."""
+        return node.cores if (self.cores_only or self.spread) else len(node.cpus)
+
+    def node_capacity(self, node: Node) -> int:
+        return node.cores if self.cores_only else len(node.cpus)
+
+
 def capacity(node: Node, cores_only: bool) -> int:
     return node.cores if cores_only else len(node.cpus)
 
@@ -133,44 +212,70 @@ def nodes_needed(req: Request, nodes: Sequence[Node], cores_only: bool) -> Optio
     return len(nodes)  # RAM trop grosse même pour tout l'hôte : policy preferred
 
 
-def _mem_fits(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]]) -> bool:
+def _mem_fits(req: Request, win: Tuple[Node, ...], ctx: _Ctx) -> bool:
     share = req.mem_mb / len(win)
-    return all(load[n.id][0] + share <= n.mem_mb * MEM_FIT for n in win)
+    return all(ctx.load[n.id][0] + share <= n.mem_mb * MEM_FIT for n in win)
 
 
-def _score(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]],
-           cores_only: bool) -> float:
+def _lane_load(ctx: _Ctx, node: Node, lane: int) -> float:
+    per_lane = ctx.load[node.id][2]
+    return per_lane[lane % len(per_lane)]
+
+
+def _peak(req: Request, win: Tuple[Node, ...], ctx: _Ctx, lane: int = -1) -> float:
+    """Occupation CPU du nœud (ou de la voie) le plus chargé de la fenêtre, invité compris."""
+    share = cpu_weight(req) / len(win)
+    if lane < 0:
+        return max((ctx.load[n.id][1] + share) / ctx.node_capacity(n) for n in win)
+    return max((_lane_load(ctx, n, lane) + share) / len(lane_cpus(n, lane)) for n in win)
+
+
+def _score(req: Request, win: Tuple[Node, ...], ctx: _Ctx, lane: int) -> float:
     k = len(win)
-    return sum((load[n.id][0] + req.mem_mb / k) / n.mem_mb
-               + (load[n.id][1] + cpu_weight(req) / k) / capacity(n, cores_only)
-               for n in win) / k
+    mem = sum((ctx.load[n.id][0] + req.mem_mb / k) / n.mem_mb for n in win) / k
+    return mem + _peak(req, win, ctx, lane)
+
+
+def _lanes_for(req: Request, win: Tuple[Node, ...], ctx: _Ctx, hint: int) -> List[int]:
+    """Voies candidates : celles assez larges pour les vCPU de la VM (cœurs P/E inégaux)."""
+    if not ctx.spread:
+        return [-1]
+    width = min(smt_width(n) for n in win)
+    if 0 <= hint < width:
+        return [hint]
+    wide = [j for j in range(width) if sum(len(lane_cpus(n, j)) for n in win) >= req.vcpus]
+    return wide or [0]
 
 
 def _position(node: Node, nodes: Sequence[Node]) -> int:
     return sorted(n.id for n in nodes).index(node.id)
 
 
-def _best(req: Request, cands: List[Tuple[Node, ...]], nodes: Sequence[Node],
-          load: Dict[int, List[float]], cores_only: bool, reason: str) -> Placement:
-    fitting = [w for w in cands if _mem_fits(req, w, load)]
+def _best(req: Request, cands: List[Tuple[Node, ...]], ctx: _Ctx, reason: str,
+          lane_hint: int = -1) -> Placement:
+    fitting = [w for w in cands if _mem_fits(req, w, ctx)]
     pool = fitting or cands
     # fenêtres alignées d'abord (0-1, 2-3…) : évite d'isoler des nœuds seuls
-    aligned = [w for w in pool if _position(w[0], nodes) % len(w) == 0] or pool
-    win = min(aligned, key=lambda w: (_score(req, w, load, cores_only), w[0].id))
+    aligned = [w for w in pool if _position(w[0], ctx.nodes) % len(w) == 0] or pool
+    options = [(w, j) for w in aligned for j in _lanes_for(req, w, ctx, lane_hint)]
+    win, lane = min(options, key=lambda o: (_score(req, o[0], ctx, o[1]), o[0][0].id, o[1]))
     # avec ballooning, la RAM peut regonfler au-delà du nœud : jamais de liaison stricte
     policy = "bind" if fitting and not req.elastic else "preferred"
     span = "" if len(win) == 1 else ", {} nœuds contigus".format(len(win))
     balloon = ", ballooning" if req.elastic else ""
-    return Placement(req.key, win, policy, reason + span + balloon)
+    smt = ", thread {}/{}".format(lane + 1, min(smt_width(n) for n in win)) if lane >= 0 else ""
+    return Placement(req.key, win, policy, reason + span + smt + balloon, lane)
 
 
-def place_one(req: Request, nodes: Sequence[Node], load: Dict[int, List[float]],
+def place_one(req: Request, nodes: Sequence[Node], load: Optional[_Ctx] = None,
               cores_only: bool = False, rebalance: bool = False) -> Placement:
+    ctx = load if isinstance(load, _Ctx) else _Ctx(nodes, cores_only, False, None)
     if req.manual:
         return Placement(req.key, (), "", "manuel : non modifié")
-    k = nodes_needed(req, nodes, cores_only)
+    k = nodes_needed(req, nodes, ctx.cores_only or ctx.spread)
     if k is None:
-        return Placement(req.key, (), "", "ignoré : {} vCPU > capacité de l'hôte".format(req.vcpus))
+        unit = "cœurs" if ctx.spread else "pCPU"
+        return Placement(req.key, (), "", "ignoré : {} vCPU > {} de l'hôte".format(req.vcpus, unit))
     cands = windows(nodes, k)
     known = {n.id for n in nodes}
     pci = [p for p in req.pci_nodes if p in known]
@@ -178,68 +283,70 @@ def place_one(req: Request, nodes: Sequence[Node], load: Dict[int, List[float]],
         with_card = [w for w in cands if pci[0] in {n.id for n in w}]
         most = max(len(set(pci) & {n.id for n in w}) for w in with_card)
         best = [w for w in with_card if len(set(pci) & {n.id for n in w}) == most]
-        return _best(req, best, nodes, load, cores_only, "passthrough nœud {}".format(pci[0]))
+        return _best(req, best, ctx, "passthrough nœud {}".format(pci[0]), req.lane)
     if req.auto and req.current and not rebalance:
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:
-            back = _return_home(req, cands, nodes, load, cores_only)
-            return back or _keep_or_evacuate(req, same[0], cands, nodes, load, cores_only)
-    return _best(req, cands, nodes, load, cores_only, "équilibrage")
+            back = _return_home(req, cands, ctx)
+            return back or _keep_or_evacuate(req, same[0], cands, ctx)
+    return _best(req, cands, ctx, "équilibrage")
 
 
-def _peak(req: Request, win: Tuple[Node, ...], load: Dict[int, List[float]],
-          cores_only: bool) -> float:
-    """Taux d'occupation CPU du nœud le plus chargé de la fenêtre, invité compris."""
-    share = cpu_weight(req) / len(win)
-    return max((load[n.id][1] + share) / capacity(n, cores_only) for n in win)
-
-
-def _return_home(req: Request, cands: List[Tuple[Node, ...]], nodes: Sequence[Node],
-                 load: Dict[int, List[float]], cores_only: bool) -> Optional[Placement]:
+def _return_home(req: Request, cands: List[Tuple[Node, ...]], ctx: _Ctx) -> Optional[Placement]:
     """VM évacuée : la ramener sur le nœud de sa RAM dès que la charge y est retombée."""
     home = tuple(sorted(req.home))
     if not home or home == tuple(sorted(req.current)) or req.cooldown or req.usage is None:
         return None
     win = [w for w in cands if tuple(n.id for n in w) == home]
-    if not win or _peak(req, win[0], load, cores_only) > RETURN_LOAD:
+    if not win:
         return None
     label = "retour près de sa RAM (nœud(s) {})".format(format_cpulist(home))
-    return _best(req, win, nodes, load, cores_only, label)
+    back = _best(req, win, ctx, label)
+    return back if _peak(req, back.nodes, ctx, back.lane) <= RETURN_LOAD else None
 
 
 def _keep_or_evacuate(req: Request, current: Tuple[Node, ...], cands: List[Tuple[Node, ...]],
-                      nodes: Sequence[Node], load: Dict[int, List[float]],
-                      cores_only: bool) -> Placement:
+                      ctx: _Ctx) -> Placement:
     """Une VM déjà placée reste, sauf petite VM sur des nœuds saturés par la charge réelle."""
-    keep = _best(req, [current], nodes, load, cores_only, "placement conservé")
+    keep = _best(req, [current], ctx, "placement conservé", req.lane)
     if req.usage is None or req.cooldown or is_hot(req):
         return keep
-    before = _peak(req, current, load, cores_only)
+    before = _peak(req, current, ctx, keep.lane)
     if before <= OVERLOAD:
         return keep
-    moved = _best(req, cands, nodes, load, cores_only, "évacuation")
-    gain_pcpu = (before - _peak(req, moved.nodes, load, cores_only)) * capacity(current[0], cores_only)
-    if moved.node_ids == keep.node_ids or gain_pcpu < MOVE_GAIN:
+    moved = _best(req, cands, ctx, "évacuation")
+    unit = len(lane_cpus(current[0], keep.lane)) if keep.lane >= 0 else ctx.node_capacity(current[0])
+    gain_pcpu = (before - _peak(req, moved.nodes, ctx, moved.lane)) * unit
+    if (moved.node_ids, moved.lane) == (keep.node_ids, keep.lane) or gain_pcpu < MOVE_GAIN:
         return keep
     label = "évacuation : nœud(s) {} à {:.0%}".format(format_cpulist(keep.node_ids), before)
     return moved._replace(reason=moved.reason.replace("évacuation", label, 1))
 
 
-def _add_load(load: Dict[int, List[float]], req: Request, ids: Sequence[int]) -> None:
-    ids = [i for i in ids if i in load]
+def _add_load(ctx: _Ctx, req: Request, ids: Sequence[int], lane: int) -> None:
+    ids = [i for i in ids if i in ctx.load]
     for i in ids:
-        load[i][0] += req.mem_mb / len(ids)
-        load[i][1] += cpu_weight(req) / len(ids)
+        entry = ctx.load[i]
+        share = cpu_weight(req) / len(ids)
+        entry[0] += req.mem_mb / len(ids)
+        entry[1] += share
+        per_lane = entry[2]
+        if lane >= 0:
+            per_lane[lane % len(per_lane)] += share
+        else:  # nœud entier (épinglage manuel, mode sans voies) : réparti sur les voies
+            for j in range(len(per_lane)):
+                per_lane[j] += share / len(per_lane)
 
 
 def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = False,
-         rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None
-         ) -> Dict[str, Placement]:
-    """reserved_mb : mémoire déjà prise par nœud hors invités (ex. dom0 Xen), en Mo."""
-    load = {n.id: [float((reserved_mb or {}).get(n.id, 0)), 0.0] for n in nodes}  # type: Dict[int, List[float]]
+         rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None,
+         spread: bool = False) -> Dict[str, Placement]:
+    """reserved_mb : mémoire déjà prise par nœud hors invités (ex. dom0 Xen), en Mo.
+    spread : une voie SMT par VM (jamais deux threads d'un même cœur dans une VM)."""
+    ctx = _Ctx(nodes, cores_only, spread, reserved_mb)
     for r in reqs:
         if r.manual and r.current:
-            _add_load(load, r, r.current)
+            _add_load(ctx, r, r.current, r.lane)
     kept = lambda r: r.auto and bool(r.current) and not rebalance  # noqa: E731
     # d'abord les ancres (carte, VM chaudes), puis les plus gros consommateurs :
     # les petites VM sont jugées contre la charge réelle déjà posée
@@ -247,8 +354,8 @@ def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = Fals
                                         -cpu_weight(r), -r.vcpus, -r.mem_mb, r.key))
     out = {}  # type: Dict[str, Placement]
     for r in order:
-        p = place_one(r, nodes, load, cores_only, rebalance)
+        p = place_one(r, nodes, ctx, cores_only, rebalance)
         if p.nodes:
-            _add_load(load, r, p.node_ids)
+            _add_load(ctx, r, p.node_ids, p.lane)
         out[r.key] = p
     return out

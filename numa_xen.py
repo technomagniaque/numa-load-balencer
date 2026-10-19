@@ -49,20 +49,24 @@ def parse_xl_info(text: str) -> Tuple[List[core.Node], Dict[str, int]]:
     """Rend (nœuds, {adresse PCI: nœud}) depuis la sortie de « xl info -n »."""
     sec = _sections(text)
     cpus_of = {}   # type: Dict[int, List[int]]
-    cores_of = {}  # type: Dict[int, set]
+    cores_of = {}  # type: Dict[Tuple[int, int, int], List[int]]  (nœud, socket, cœur) -> threads
     for line in sec.get("cpu_topology", []):
         m = re.match(r"^\s*(\d+):\s+(\d+)\s+(\d+)\s+(\d+)\s*$", line)
         if m:
             cpu, core_id, socket, node = (int(x) for x in m.groups())
             cpus_of.setdefault(node, []).append(cpu)
-            cores_of.setdefault(node, set()).add((socket, core_id))
+            cores_of.setdefault((node, socket, core_id), []).append(cpu)
     mem_of = {}  # type: Dict[int, int]
     for line in sec.get("numa_info", []):
         m = re.match(r"^\s*(\d+):\s+(\d+)\s+(\d+)", line)
         if m:
             mem_of[int(m.group(1))] = int(m.group(2))  # memsize, en Mo
-    nodes = [core.Node(n, tuple(sorted(cpus_of[n])), len(cores_of[n]), mem_of[n])
-             for n in sorted(cpus_of) if n in mem_of]
+    nodes = []
+    for n in sorted(cpus_of):
+        if n not in mem_of:
+            continue  # nœud sans RAM connue (ex. Xeon Phi : MCDRAM sans CPU, et l'inverse)
+        threads = tuple(sorted(tuple(sorted(cpus)) for (nid, _, _), cpus in cores_of.items() if nid == n))
+        nodes.append(core.Node(n, tuple(sorted(cpus_of[n])), len(threads), mem_of[n], threads))
     pci = {}  # type: Dict[str, int]
     for line in sec.get("device topology", []):
         m = re.match(r"^\s*([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])\s+(\d+)\s*$", line, re.I)

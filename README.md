@@ -9,6 +9,13 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 - invité avec passthrough (GPU, VF SR-IOV) → nœud de la carte ;
 - invité sans passthrough → nœud le moins chargé (RAM + vCPU), puis conservé ;
 - invité plus grand qu'un nœud → plusieurs nœuds **contigus**, alignés (0-1, 2-3) ;
+- **SMT : jamais deux threads d'un même cœur dans une VM** (par défaut). Chaque nœud est découpé en
+  « voies » : la voie *j* réunit le *j*-ième thread de chaque cœur, et une VM reçoit une seule voie.
+  Ses vCPU ne se disputent donc jamais un cœur, et les frères d'un cœur vont à des VM différentes.
+  Marche en SMT1, SMT2, SMT4 (Xeon Phi), SMT8, et avec des cœurs hybrides (P/E, big.LITTLE : la voie 1
+  ne contient que les cœurs qui ont un 2ᵉ thread). Une VM a au plus autant de vCPU que de cœurs dans
+  sa fenêtre de nœuds ; au-delà, elle prend des nœuds contigus de plus. `--smt-share` revient au
+  placement sur nœuds entiers (threads frères possibles dans une même VM) ;
 - `--cores-only` : un nœud contient ses cœurs physiques (8), pas ses threads (16) ;
   une VM à 16 vCPU prend alors 2 nœuds contigus ;
 - invités épinglés à la main, ou marqués `numa-manual` → non modifiés, mais comptés dans la charge.
@@ -32,6 +39,20 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 | `pve/pve-numa-place` | Proxmox VE 8/9 : KVM (`affinity`, `numaN hostnodes`) et LXC (`cpuset`) | 3.9+ |
 | `xcp-ng/xcpng-numa-place` | XCP-ng 8.3 : `VCPUs-params:mask` + tag `numa-auto` | 3.6+ |
 | `xen-libvirt/xen-numa-place` | Debian 13 dom0 + libvirt (libxl) : `<vcpu cpuset>` + `<metadata>` | 3.6+ |
+
+## Matériel pris en charge
+
+La topologie n'est jamais supposée : elle est lue sur l'hôte.
+
+| Source | Ce qui est lu |
+|---|---|
+| Proxmox / Linux (sysfs) | nœuds `node*/cpulist`, RAM `node*/meminfo`, frères SMT `core_cpus_list` ou `thread_siblings_list` (repli : paquet + `core_id`) |
+| Xen / XCP-ng (`xl info -n`) | CPU → (cœur, socket, nœud), RAM par nœud, nœud de chaque carte PCI |
+
+Testé (tests unitaires) sur : EPYC Zen 1 (4 nœuds, SMT désactivé ou SMT2), Dell R710 2× Xeon Westmere
+6 cœurs SMT2 (numérotation entrelacée des sockets), Xeon Phi SMT4 avec nœud MCDRAM sans CPU,
+SMT8, cœurs hybrides, ARM sans SMT. Sous Xen sur ARM, la topologie NUMA n'est fournie que par les
+versions récentes de Xen : sans `cpu_topology`, l'outil voit un seul nœud et ne fait rien.
 
 ## Paquets .deb (Debian 13 et Proxmox VE)
 

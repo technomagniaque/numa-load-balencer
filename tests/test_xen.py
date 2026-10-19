@@ -385,6 +385,16 @@ class BusyBigVmXe(FakeXe):
         return super().__call__(cmd)
 
 
+class XcpngSpreadTest(unittest.TestCase):
+    def test_default_cli_mode_puts_one_thread_per_core_in_masks(self):
+        m = load_script("xnp4", NUMA_DIR / "xcp-ng/xcpng-numa-place", {})
+        xe = FakeXe()
+        nodes, pci = xen.read_topology(xe)
+        for vm, p in m.build_plan(nodes, pci, m.load_vms(xe), spread=True):
+            if p.nodes:
+                self.assertEqual(len({c % 32 for c in p.cpus}), len(p.cpus), vm.name)
+
+
 class XcpngLoadBalancingTest(unittest.TestCase):
     def test_apply_evacuates_small_vm_live_and_records_move(self):
         from unittest import mock
@@ -393,7 +403,7 @@ class XcpngLoadBalancingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m.STATE = os.path.join(tmp, "state.json")
             with mock.patch("time.sleep"), mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
-                rc = m.main(["apply", "--live", "--cores-only", "--sample", "5"], run=xe)
+                rc = m.main(["apply", "--live", "--cores-only", "--smt-share", "--sample", "5"], run=xe)
             state = m.st.load(m.STATE)
         self.assertEqual(rc, 0)
         self.assertEqual(xe.vms["u-big"]["VCPUs-params"],
@@ -415,7 +425,7 @@ class XcpngLoadBalancingTest(unittest.TestCase):
         node1 = "mask: " + ",".join(map(str, list(range(8, 16)) + list(range(40, 48))))
         with tempfile.TemporaryDirectory() as tmp:
             m.STATE = os.path.join(tmp, "state.json")
-            args = ["apply", "--live", "--cores-only", "--sample", "5"]
+            args = ["apply", "--live", "--cores-only", "--smt-share", "--sample", "5"]
             with mock.patch("time.sleep"), mock.patch("time.time", return_value=1000.0), \
                     mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
                 m.main(args, run=xe)

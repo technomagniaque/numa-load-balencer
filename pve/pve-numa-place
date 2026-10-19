@@ -83,12 +83,25 @@ def _read(path: str) -> str | None:
 
 # ---------------------------------------------------------------- topologie
 
-def _physical_cores(cpus: tuple[int, ...]) -> int:
-    cores = set()
+def _siblings(cpus: tuple[int, ...]) -> dict[int, tuple[int, ...]]:
+    """Frères SMT de chaque CPU, tels que le noyau les calcule (x86, ARM, POWER, hybrides).
+
+    core_cpus_list (noyaux récents) ou thread_siblings_list ; à défaut, regroupement
+    par (paquet, core_id), qui n'est pas unique sur certains ARM."""
+    out: dict[int, tuple[int, ...]] = {}
+    by_core: dict[tuple, list[int]] = {}
     for c in cpus:
         topo = f"{SYSFS}/devices/system/cpu/cpu{c}/topology"
-        cores.add((_read(f"{topo}/physical_package_id"), _read(f"{topo}/core_id") or str(c)))
-    return len(cores)
+        listed = _read(f"{topo}/core_cpus_list") or _read(f"{topo}/thread_siblings_list")
+        if listed and listed.strip():
+            out[c] = parse_cpulist(listed)
+            continue
+        key = ((_read(f"{topo}/physical_package_id") or "").strip(), (_read(f"{topo}/core_id") or str(c)).strip())
+        by_core.setdefault(key, []).append(c)
+    for group in by_core.values():
+        for c in group:
+            out[c] = tuple(group)
+    return out
 
 
 def _node_meminfo(nid: int) -> dict[str, int]:
@@ -129,7 +142,8 @@ def read_topology() -> list[Node]:
         cpus = parse_cpulist(_read(f"{d}/cpulist") or "")
         m = re.search(r"MemTotal:\s+(\d+)\s*kB", _read(f"{d}/meminfo") or "")
         if cpus and m:
-            nodes.append(Node(nid, cpus, _physical_cores(cpus), int(m.group(1)) // 1024))
+            threads = core.group_siblings(cpus, _siblings(cpus))
+            nodes.append(Node(nid, cpus, len(threads), int(m.group(1)) // 1024, threads))
     return nodes
 
 
@@ -346,7 +360,14 @@ def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
     cooling = state is not None and st.in_cooldown(state, key, now)
     home = st.home(state, key, boot_id(g)) if state is not None else ()
     return Request(key, g.vcpus, g.guaranteed_mb, pci_nodes, current_nodes(g, nodes),
-                   is_auto(g), is_manual(g), g.elastic, usage, cooling, home)
+                   is_auto(g), is_manual(g), g.elastic, usage, cooling, home,
+                   core.lane_of(current_cpus(g), nodes))
+
+
+def current_cpus(g: Guest) -> tuple[int, ...]:
+    """pCPU actuellement permis : affinity (KVM) ou cpuset (LXC), () si non épinglé."""
+    raw = g.get("affinity") if g.kind == "qemu" else g.get(LXC_CPUS)
+    return parse_cpulist(raw) if raw else ()
 
 
 def boot_id(g: Guest) -> str:
@@ -549,10 +570,10 @@ def actual_state(g: Guest) -> str:
 
 def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
                rebalance: bool = False, state: st.State | None = None,
-               now: float = 0.0, reserved_mb: dict[int, int] | None = None
-               ) -> list[tuple[Guest, Placement]]:
+               now: float = 0.0, reserved_mb: dict[int, int] | None = None,
+               spread: bool = False) -> list[tuple[Guest, Placement]]:
     reqs = [to_request(g, nodes, state, now) for g in guests]
-    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb)
+    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
     return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
 
 
@@ -573,6 +594,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les invités déjà placés")
     ap.add_argument("--cores-only", action="store_true",
                     help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    ap.add_argument("--smt-share", action="store_true",
+                    help="autorise deux threads d'un même cœur dans une VM (défaut : jamais)")
     ap.add_argument("--sample", type=float, default=10.0, metavar="S",
                     help="mesure la charge CPU réelle pendant S secondes (0 : nominale)")
     args = ap.parse_args(argv)
@@ -590,7 +613,8 @@ def main(argv: list[str] | None = None) -> int:
     state = None
     if args.sample > 0 and args.cmd != "status":
         state = st.smooth(saved, measure_usage(guests, args.sample))
-    pairs = build_plan(nodes, guests, args.cores_only, args.rebalance, state, now, host)
+    pairs = build_plan(nodes, guests, args.cores_only, args.rebalance, state, now, host,
+                       spread=not args.smt_share)
     selected = [(g, p) for g, p in pairs if not args.vmids or g.vmid in args.vmids]
     if args.cmd == "plan":
         show_plan(selected, state)

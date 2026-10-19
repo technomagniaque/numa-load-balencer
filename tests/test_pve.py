@@ -241,7 +241,7 @@ class PveTest(unittest.TestCase):
         with mock.patch.object(self.m, "_read", side_effect=read), mock.patch("time.sleep"), \
                 mock.patch.object(self.m, "_run", side_effect=fake_qm), \
                 mock.patch("time.monotonic", side_effect=[0.0, 5.0]), mock.patch("time.time", return_value=1000.0):
-            rc = self.m.main(["apply", "--cores-only", "--sample", "5"])
+            rc = self.m.main(["apply", "--cores-only", "--smt-share", "--sample", "5"])
         self.assertEqual(rc, 0)
         state = self.m.st.load(self.m.STATE)
         self.assertEqual(state["100"]["ema"], 15.0)
@@ -249,6 +249,25 @@ class PveTest(unittest.TestCase):
         mems = re.search(r"cpuset.mems: (\S+)", (self.root / "pve/lxc/101.conf").read_text()).group(1)
         self.assertIn(mems, ("2", "3"))                     # évacué loin de la grosse VM
         self.assertEqual(state["101"]["home"], [1])
+
+    def test_siblings_from_kernel_lists_win_over_core_id(self):
+        # ARM : core_id répété d'un cluster à l'autre ; seules les listes du noyau sont fiables
+        for c in range(64):
+            topo = self.root / f"sys/devices/system/cpu/cpu{c}/topology"
+            write(topo / "core_id", "0\n")
+            write(topo / "thread_siblings_list", f"{c % 32},{c % 32 + 32}\n")
+        nodes = self.m.read_topology()
+        self.assertEqual(nodes[2].threads[0], (16, 48))
+        self.assertEqual((nodes[2].cores, self.m.core.smt_width(nodes[2])), (8, 2))
+
+    def test_spread_gives_each_vm_one_thread_per_core(self):
+        self.host.vm(100, "cores: 8\nmemory: 4096\n")
+        self.host.ct(101, "cores: 8\nmemory: 4096\n")
+        pairs = self.m.build_plan(self.m.read_topology(), self.m.load_guests(), spread=True)
+        for g, p in pairs:
+            cores = {c % 32 for c in p.cpus}
+            self.assertEqual(len(cores), len(p.cpus), g.vmid)   # jamais deux frères
+            self.assertEqual(len(p.cpus), 8)
 
     def test_manual_and_opt_out_untouched(self):
         self.host.vm(400, "cores: 2\nmemory: 2048\naffinity: 0-3\n")

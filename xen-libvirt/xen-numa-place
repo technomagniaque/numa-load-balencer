@@ -169,7 +169,8 @@ def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
     cooling = state is not None and st.in_cooldown(state, vm.name, now)
     home = st.home(state, vm.name, vm.domid) if state is not None else ()
     return core.Request(vm.name, vm.vcpus, vm.guaranteed_mb, cards, current,
-                        vm.mode == "auto", is_manual(vm), vm.elastic, usage, cooling, home)
+                        vm.mode == "auto", is_manual(vm), vm.elastic, usage, cooling, home,
+                        core.lane_of(vm.cpuset, nodes))
 
 
 def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, float]:
@@ -181,10 +182,10 @@ def measure_usage(run: xen.Runner, vms: List[Vm], seconds: float) -> Dict[str, f
 def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
                cores_only: bool = False, rebalance: bool = False,
                reserved_mb: Optional[Dict[int, int]] = None,
-               state: Optional[st.State] = None, now: float = 0.0
-               ) -> List[Tuple[Vm, core.Placement]]:
+               state: Optional[st.State] = None, now: float = 0.0,
+               spread: bool = False) -> List[Tuple[Vm, core.Placement]]:
     reqs = [to_request(v, nodes, pci_nodes, state, now) for v in vms]
-    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb)
+    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
     return [(vm, placements[vm.name]) for vm in sorted(vms, key=lambda v: v.name)]
 
 
@@ -257,6 +258,8 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
     ap.add_argument("--rebalance", action="store_true", help="recalcule aussi les VM déjà placées")
     ap.add_argument("--cores-only", action="store_true",
                     help="capacité d'un nœud = cœurs physiques (les threads SMT ne comptent pas)")
+    ap.add_argument("--smt-share", action="store_true",
+                    help="autorise deux threads d'un même cœur dans une VM (défaut : jamais)")
     ap.add_argument("--sample", type=float, default=10.0, metavar="S",
                     help="mesure la charge CPU réelle pendant S secondes (0 : nominale)")
     args = ap.parse_args(argv)
@@ -272,7 +275,8 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
     state = None
     if args.sample > 0 and args.cmd != "status":
         state = st.smooth(saved, measure_usage(run, vms, args.sample))
-    pairs = build_plan(nodes, pci_nodes, vms, args.cores_only, args.rebalance, dom0, state, now)
+    pairs = build_plan(nodes, pci_nodes, vms, args.cores_only, args.rebalance, dom0, state, now,
+                       spread=not args.smt_share)
     selected = [(vm, p) for vm, p in pairs if not args.vms or vm.name in args.vms]
     if args.cmd == "plan":
         show_plan(selected, state)
