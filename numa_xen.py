@@ -7,28 +7,14 @@ de chaque périphérique PCI (section « device topology »). Compatible Python 
 """
 import os
 import re
-import subprocess
-import sys
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numa_core as core
+import numa_linux as linux
 import numa_state as st
 
-Runner = Callable[[List[str]], Optional[str]]
-
-
-def run_cmd(cmd: List[str]) -> Optional[str]:
-    """Lance une commande ; rend sa sortie, ou None (erreur journalisée) si elle échoue."""
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             universal_newlines=True, check=False)
-    except OSError as exc:
-        print("échec {} : {}".format(" ".join(cmd), exc), file=sys.stderr)
-        return None
-    if res.returncode != 0:
-        print("échec {} : {}".format(" ".join(cmd), res.stderr.strip()), file=sys.stderr)
-        return None
-    return res.stdout
+Runner = linux.Runner
+run_cmd = linux.run_cmd   # commun à tous les outils (numa_linux)
 
 
 def _sections(text: str) -> Dict[str, List[str]]:

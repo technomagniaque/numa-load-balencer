@@ -26,10 +26,8 @@ chaud (--live), puis ne rebouge pas avant 10 minutes.
 import argparse
 import os
 import sys
-import tempfile
 import time
-import xml.etree.ElementTree as ET
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _import_libs():
@@ -43,15 +41,12 @@ def _import_libs():
 _import_libs()
 import numa_core as core  # noqa: E402
 import numa_state as st  # noqa: E402
+import numa_libvirt as lv  # noqa: E402
 import numa_xen as xen  # noqa: E402
 
 URI = os.environ.get("XNP_URI", "xen:///system")
 SYSFS = os.environ.get("XNP_SYSFS", "/sys")
 STATE = os.environ.get("XNP_STATE", "/var/lib/numa-place/xen-state.json")
-NS = "urn:numa-place:1"
-ET.register_namespace("np", NS)
-MEM_UNITS = {"b": 1, "bytes": 1, "KiB": 2**10, "k": 2**10, "MiB": 2**20, "M": 2**20,
-             "GiB": 2**30, "G": 2**30, "TiB": 2**40, "T": 2**40}
 
 
 def log(msg: str) -> None:
@@ -62,102 +57,16 @@ def virsh(run: xen.Runner, *args: str) -> Optional[str]:
     return run(["virsh", "-q", "-c", URI] + list(args))
 
 
-class Vm(NamedTuple):
-    name: str
-    xml: str                   # définition persistante (--inactive)
-    vcpus: int
-    mem_mb: int
-    pci: Tuple[str, ...]
-    cpuset: Tuple[int, ...]    # () si absent
-    mode: str                  # "auto" | "manual" | ""
-    running: bool
-    mem_min_mb: int = 0        # <currentMemory> (cible du ballooning) si < <memory>
-    domid: str = ""            # change à chaque démarrage (RAM réallouée)
-
-    @property
-    def guaranteed_mb(self) -> int:
-        return self.mem_min_mb or self.mem_mb
-
-    @property
-    def elastic(self) -> bool:
-        return 0 < self.mem_min_mb < self.mem_mb
-
-
-# ---------------------------------------------------------------- lecture
-
-def _pci_addr(addr: ET.Element) -> str:
-    vals = [int(addr.get(k, "0"), 0) for k in ("domain", "bus", "slot", "function")]
-    return "{:04x}:{:02x}:{:02x}.{:x}".format(*vals)
-
-
-def _pool_addr(run: xen.Runner, network: str) -> Optional[str]:
-    """Carte d'un réseau libvirt <forward mode='hostdev'> -> adresse PCI.
-
-    Le pool peut lister ses VF (<address …/>, seule forme qui marche avec une
-    Chelsio, dont les VF sont sous les PF 0-3) ou nommer la PF (<pf dev=…/>).
-    La VM reçoit une VF quelconque du pool : la première sert de référence."""
-    text = virsh(run, "net-dumpxml", network)
-    if not text:
-        return None
-    forward = ET.fromstring(text).find("./forward[@mode='hostdev']")
-    if forward is None:
-        return None
-    vf = forward.find("address[@type='pci']")
-    if vf is not None:
-        return _pci_addr(vf)
-    pf = forward.find("pf")
-    if pf is None or not pf.get("dev"):
-        return None
-    real = os.path.realpath(os.path.join(SYSFS, "class/net", pf.get("dev"), "device"))
-    return os.path.basename(real) if os.path.exists(real) else None
-
-
-def pci_of(root: ET.Element, run: xen.Runner) -> Tuple[str, ...]:
-    addrs = [_pci_addr(a) for a in root.findall("./devices/hostdev[@type='pci']/source/address")]
-    addrs += [_pci_addr(a) for a in root.findall("./devices/interface[@type='hostdev']/source/address")]
-    for src in root.findall("./devices/interface[@type='network']/source"):
-        card = _pool_addr(run, src.get("network", ""))
-        if card and card not in addrs:
-            addrs.append(card)
-    return tuple(addrs)
-
-
-def _bytes(elem: Optional[ET.Element]) -> int:
-    if elem is None or not (elem.text or "").strip():
-        return 0
-    return int(elem.text) * MEM_UNITS.get(elem.get("unit", "KiB"), 2**10)
-
-
-def load_vm(run: xen.Runner, name: str) -> Vm:
-    text = virsh(run, "dumpxml", "--inactive", name) or "<domain/>"
-    root = ET.fromstring(text)
-    vcpu = root.find("vcpu")
-    mem_bytes = _bytes(root.find("memory"))
-    cur_bytes = _bytes(root.find("currentMemory"))
-    mark = root.find("./metadata/{%s}place" % NS)
-    domid = (virsh(run, "domid", name) or "").strip()
-    return Vm(
-        name=name, xml=text,
-        vcpus=int(vcpu.text) if vcpu is not None else 1,
-        mem_mb=mem_bytes // 2**20,
-        pci=pci_of(root, run),
-        cpuset=core.parse_cpulist(vcpu.get("cpuset")) if vcpu is not None and vcpu.get("cpuset") else (),
-        mode=mark.get("mode", "") if mark is not None else "",
-        running=domid.isdigit(),
-        mem_min_mb=cur_bytes // 2**20 if 0 < cur_bytes < mem_bytes else 0,
-        domid=domid if domid.isdigit() else "",
-    )
+Vm = lv.Domain   # domaine libvirt (lecture commune avec kvm-numa-place)
 
 
 def load_vms(run: xen.Runner = xen.run_cmd) -> List[Vm]:
-    names = (virsh(run, "list", "--all", "--name") or "").split()
-    return [load_vm(run, n) for n in names if n != "Domain-0"]
+    return lv.load_domains(lambda *a: virsh(run, *a), SYSFS)
 
 
 # ---------------------------------------------------------------- placement
 
-def is_manual(vm: Vm) -> bool:
-    return vm.mode == "manual" or (bool(vm.cpuset) and vm.mode != "auto")
+is_manual = lv.is_manual
 
 
 def to_request(vm: Vm, nodes: List[core.Node], pci_nodes: Dict[str, int],
@@ -193,32 +102,13 @@ def build_plan(nodes: List[core.Node], pci_nodes: Dict[str, int], vms: List[Vm],
 
 def placed_xml(vm: Vm, p: core.Placement) -> str:
     """Rend la définition avec le cpuset et la marque numa-place « auto »."""
-    root = ET.fromstring(vm.xml)
-    vcpu = root.find("vcpu")
-    if vcpu is None:
-        vcpu = ET.SubElement(root, "vcpu")
-        vcpu.text = str(vm.vcpus)
-    vcpu.set("cpuset", core.format_cpulist(p.cpus))
-    meta = root.find("metadata")
-    if meta is None:
-        meta = ET.SubElement(root, "metadata")
-    mark = meta.find("{%s}place" % NS)
-    if mark is None:
-        mark = ET.SubElement(meta, "{%s}place" % NS)
-    mark.set("mode", "auto")
-    return ET.tostring(root, encoding="unicode")
+    return lv.placed_xml(vm, p.cpus)
 
 
 def apply_one(vm: Vm, p: core.Placement, live: bool, run: xen.Runner = xen.run_cmd) -> bool:
     if vm.cpuset != p.cpus or vm.mode != "auto":
-        fd, path = tempfile.mkstemp(suffix=".xml")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(placed_xml(vm, p))
-            if virsh(run, "define", path) is None:
-                return False
-        finally:
-            os.unlink(path)
+        if not lv.define(lambda *a: virsh(run, *a), placed_xml(vm, p)):
+            return False
         log("{}: nœud(s) {} ({}) — mémoire placée au prochain démarrage".format(
             vm.name, core.format_cpulist(p.node_ids), p.reason))
     if live and vm.running:

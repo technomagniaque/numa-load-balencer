@@ -1,0 +1,11 @@
+[Unit]
+Description=Replace périodiquement les VM KVM
+
+[Timer]
+OnBootSec=3min
+# toutes les 30 s ; AccuracySec=1s sinon systemd regroupe à la minute près
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
