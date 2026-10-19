@@ -262,12 +262,13 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
     if len(nodes) < 2:
         log("un seul nœud NUMA visible : rien à faire (vérifiez le BIOS, ex. NPS/interleaving)")
         return 0
-    dom0 = xen.dom0_memory(run)  # réservé : Xen ne déplace pas la RAM du dom0
-    log("dom0 : " + xen.format_memory(dom0))
     vms, now = load_vms(run), time.time()
+    # RAM du dom0 réservée dans le calcul (Xen ne la déplace pas), relue au plus 1 fois/h
+    dom0, saved = xen.dom0_memory_cached(run, st.load(STATE), now)
+    log("dom0 : " + xen.format_memory(dom0))
     state = None
     if args.sample > 0 and args.cmd != "status":
-        state = st.smooth(st.load(STATE), measure_usage(run, vms, args.sample))
+        state = st.smooth(saved, measure_usage(run, vms, args.sample))
     pairs = build_plan(nodes, pci_nodes, vms, args.cores_only, args.rebalance, dom0, state, now)
     selected = [(vm, p) for vm, p in pairs if not args.vms or vm.name in args.vms]
     if args.cmd == "plan":
@@ -276,9 +277,8 @@ def main(argv: Optional[List[str]] = None, run: xen.Runner = xen.run_cmd) -> int
         show_status(selected, run)
     else:
         results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
-        if state is not None:
-            moved = [vm.name for vm, p in selected if p.nodes and vm.cpuset and vm.cpuset != p.cpus]
-            st.save(STATE, st.mark_moved(state, moved, now))
+        moved = [vm.name for vm, p in selected if p.nodes and vm.cpuset and vm.cpuset != p.cpus]
+        st.save(STATE, st.mark_moved(state if state is not None else saved, moved, now))
         return 0 if all(results) else 1
     return 0
 

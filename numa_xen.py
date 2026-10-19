@@ -129,6 +129,27 @@ def dom0_memory(run: Runner = run_cmd) -> Dict[int, int]:
     return {n: mb for n, mb in domain_memory(run).get(0, {}).items() if mb}
 
 
+DOM0_KEY = "__dom0__"   # entrée du fichier d'état réservée à la mémoire du dom0
+DOM0_MAX_AGE = 3600.0   # relue au plus une fois par heure
+
+
+def dom0_memory_cached(run: Runner, state: Dict[str, Dict[str, float]], now: float,
+                       max_age: float = DOM0_MAX_AGE
+                       ) -> Tuple[Dict[int, int], Dict[str, Dict[str, float]]]:
+    """Mémoire du dom0 par nœud, gardée en cache dans l'état.
+
+    « xl debug-keys u » écrit un rapport dans le journal de Xen (xl dmesg) ; le
+    relancer toutes les 30 s noierait ce journal, alors que la RAM du dom0
+    (dom0_mem fixe) ne bouge pas. Rend (mémoire, nouvel état)."""
+    cached = state.get(DOM0_KEY, {})
+    if cached and now - cached.get("at", 0.0) < max_age:
+        return {int(k): int(v) for k, v in cached.items() if k != "at"}, dict(state)
+    mem = dom0_memory(run)
+    entry = {str(k): float(v) for k, v in mem.items()}
+    entry["at"] = now
+    return mem, dict(state, **{DOM0_KEY: entry})
+
+
 def pin_live(domain: str, cpus: Sequence[int], run: Runner = run_cmd) -> bool:
     """Épingle à chaud tous les vCPU d'un domaine (affinité dure)."""
     return run(["xl", "vcpu-pin", domain, "all", core.format_cpulist(cpus)]) is not None

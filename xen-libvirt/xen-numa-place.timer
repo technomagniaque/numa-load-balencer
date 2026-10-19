@@ -3,7 +3,9 @@ Description=Replace périodiquement les nouvelles VM Xen
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=2min
+# toutes les 30 s ; AccuracySec=1s sinon systemd regroupe à la minute près
+OnUnitActiveSec=30s
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

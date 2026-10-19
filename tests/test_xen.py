@@ -108,6 +108,18 @@ class NumaXenTest(unittest.TestCase):
         self.assertEqual(xen.domain_cpu_times(run), {"0": 521.0, "7": 12.5})
         self.assertEqual(xen.domain_cpu_times(run, by_name=True)["Ma VM avec espaces"], 12.5)
 
+    def test_dom0_memory_is_cached_for_an_hour(self):
+        xl = FakeXl()
+        mem, state = xen.dom0_memory_cached(xl, {"vm": {"ema": 1.0}}, now=1000.0)
+        self.assertEqual(mem, {0: 8192})
+        self.assertEqual(state["vm"], {"ema": 1.0})  # le reste de l'état est conservé
+        xl.calls.clear()
+        again, _ = xen.dom0_memory_cached(xl, state, now=1000.0 + 3599)
+        self.assertEqual(again, {0: 8192})
+        self.assertNotIn(["xl", "debug-keys", "u"], xl.calls)  # pas de rapport dans xl dmesg
+        xen.dom0_memory_cached(xl, state, now=1000.0 + 3601)
+        self.assertIn(["xl", "debug-keys", "u"], xl.calls)
+
     def test_old_domain_header_format(self):
         text = "Memory location of each domain:\n(XEN) Domain 7 (total: 256):\n(XEN)     Node 1: 256\n"
         self.assertEqual(xen.parse_domain_memory(text), {7: {1: 1}})

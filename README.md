@@ -12,7 +12,7 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 - `--cores-only` : un nœud contient ses cœurs physiques (8), pas ses threads (16) ;
   une VM à 16 vCPU prend alors 2 nœuds contigus ;
 - invités épinglés à la main, ou marqués `numa-manual` → non modifiés, mais comptés dans la charge.
-- **équilibrage sur la charge réelle** : à chaque passage (toutes les 2 min), la consommation CPU
+- **équilibrage sur la charge réelle** : à chaque passage (toutes les 30 s), la consommation CPU
   de chaque invité est mesurée (`--sample 10` s) et lissée dans `/var/lib/numa-place/*-state.json`.
   Une VM « chaude » (≥ 50 % de ses vCPU et ≥ 2 pCPU) garde ses nœuds ; une petite VM dont les nœuds
   dépassent 85 % est **évacuée à chaud** vers les nœuds les moins chargés, si le gain dépasse 1 pCPU,
