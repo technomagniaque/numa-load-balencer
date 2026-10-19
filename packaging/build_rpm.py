@@ -74,7 +74,7 @@ VM des nœuds saturés et retour près de leur RAM. Timer systemd fourni, non ac
 
 %install
 rm -rf %{{buildroot}}
-install -d %{{buildroot}}/usr/lib/numa-place %{{buildroot}}/usr/sbin %{{buildroot}}%{{_unitdir}} \\
+install -d %{{buildroot}}/usr/lib/numa-place %{{buildroot}}/usr/sbin %{{buildroot}}/usr/lib/systemd/system \\
            %{{buildroot}}%{{_sharedstatedir}}/numa-place
 {install_modules}
 install -m 0755 {src}/{tool} %{{buildroot}}/usr/lib/numa-place/{name}
@@ -86,8 +86,8 @@ install -D -m 0644 {src}/LICENSE %{{buildroot}}%{{_docdir}}/{name}/LICENSE
 %files
 /usr/lib/numa-place
 /usr/sbin/{name}
-%{{_unitdir}}/{name}.service
-%{{_unitdir}}/{name}.timer
+/usr/lib/systemd/system/{name}.service
+/usr/lib/systemd/system/{name}.timer
 %dir %{{_sharedstatedir}}/numa-place
 %doc %{{_docdir}}/{name}/README.md
 %license %{{_docdir}}/{name}/LICENSE
@@ -124,7 +124,7 @@ def render_spec(target: str, version: str, src: str, mtime: int) -> str:
         for m in cfg["modules"])
     # unités du dépôt : /usr/local/sbin (installation manuelle) -> /usr/sbin dans le paquet
     install_units = "\n".join(
-        "sed 's#/usr/local/sbin/#/usr/sbin/#' {src}/{u} > %{{buildroot}}%{{_unitdir}}/{base}".format(
+        "sed 's#/usr/local/sbin/#/usr/sbin/#' {src}/{u} > %{{buildroot}}/usr/lib/systemd/system/{base}".format(
             src=src, u=u, base=os.path.basename(u)) for u in cfg["units"])
     return SPEC.format(
         name=name, version=version, release=cfg["release"],
