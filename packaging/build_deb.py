@@ -8,20 +8,24 @@ Produit (Architecture: all, Debian 13 / Proxmox VE 8-9) :
   pve-numa-place     outil Proxmox (KVM + LXC) + timer systemd
   xen-numa-place     outil Xen + libvirt (dom0 Debian 13) + numa_xen.py + timer
 
-Un .deb est une archive « ar » : debian-binary, control.tar.gz, data.tar.gz.
+Un .deb est une archive « ar » : debian-binary, control.tar, data.tar.
 Ce script l'écrit lui-même, avec des fichiers root:root et des dates fixes
-(SOURCE_DATE_EPOCH) : le même code donne le même paquet, ici comme dans la CI.
+(SOURCE_DATE_EPOCH). Les tar ne sont PAS compressés (dpkg l'accepte) : la sortie
+de gzip dépend de la bibliothèque (zlib, zlib-ng…), alors qu'un tar non compressé
+est identique partout. Même commit -> mêmes .deb au bit près, sur toute machine.
 Les timers sont installés mais PAS activés : appliquer un placement modifie
 les VM, c'est à l'administrateur de le décider (systemctl enable --now …).
 """
 import argparse
-import gzip
 import hashlib
 import io
 import os
+import struct
 import subprocess
 import sys
 import tarfile
+import time
+import zlib
 from typing import Dict, List, NamedTuple, Tuple
 
 NUMA = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -122,7 +126,7 @@ def packages() -> List[Package]:
          File(LIB + "/numa_state.py", read("numa_state.py"))) + doc("numa-place-common"),
         {})
     pve = Package(
-        "pve-numa-place", "numa-place-common (= {v}), python3 (>= 3.9), util-linux",
+        "pve-numa-place", "numa-place-common (= {v}), python3 (>= 3.9)",  # taskset : util-linux, essentiel
         "numactl",
         "placement NUMA automatique des VM KVM et conteneurs LXC Proxmox VE\n"
         " Place vCPU et mémoire des invités Proxmox sur le(s) même(s) nœud(s) NUMA\n"
@@ -163,10 +167,29 @@ def _tar(entries: List[Tuple[tarfile.TarInfo, bytes]], mtime: int) -> bytes:
             info.uname = info.gname = "root"
             info.mtime = mtime
             tar.addfile(info, io.BytesIO(data) if info.isreg() else None)
-    out = io.BytesIO()
-    with gzip.GzipFile(fileobj=out, mode="wb", mtime=mtime) as gz:
-        gz.write(raw.getvalue())
-    return out.getvalue()
+    return raw.getvalue()
+
+
+def stored_gzip(data: bytes, mtime: int) -> bytes:
+    """gzip sans compression (blocs deflate « stockés ») : octets identiques quelle que
+    soit la bibliothèque zlib. Sert au changelog.Debian.gz exigé par la charte Debian."""
+    out = [b"\x1f\x8b\x08\x00" + struct.pack("<I", mtime) + b"\x00\x03"]
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for i, chunk in enumerate(chunks):
+        final = 1 if i == len(chunks) - 1 else 0
+        out.append(bytes([final]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF) + chunk)
+    out.append(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
+    return b"".join(out)
+
+
+def changelog(pkg: Package, version: str, mtime: int) -> File:
+    date = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(mtime))
+    text = ("{name} ({v}) unstable; urgency=medium\n\n"
+            "  * numa-load-balencer {v} : {home}/releases\n\n"
+            " -- {who}  {date}\n").format(name=pkg.name, v=version, home=HOMEPAGE,
+                                            who=MAINTAINER, date=date)
+    return File("usr/share/doc/{}/changelog.Debian.gz".format(pkg.name),
+                stored_gzip(text.encode(), mtime))
 
 
 def _dirs(paths: List[str]) -> List[str]:
@@ -226,9 +249,10 @@ def ar_archive(members: List[Tuple[str, bytes]], mtime: int) -> bytes:
 
 
 def build(pkg: Package, version: str, out_dir: str, mtime: int) -> str:
+    pkg = pkg._replace(files=pkg.files + (changelog(pkg, version, mtime),))
     deb = ar_archive([("debian-binary", b"2.0\n"),
-                      ("control.tar.gz", control_tar(pkg, version, mtime)),
-                      ("data.tar.gz", data_tar(pkg, mtime))], mtime)
+                      ("control.tar", control_tar(pkg, version, mtime)),
+                      ("data.tar", data_tar(pkg, mtime))], mtime)
     path = os.path.join(out_dir, "{}_{}_all.deb".format(pkg.name, version))
     with open(path, "wb") as fh:
         fh.write(deb)

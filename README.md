@@ -73,10 +73,17 @@ apt install ./numa-place-common_*_all.deb ./pve-numa-place_*_all.deb
 **Releases GitHub** : pousser un tag `numa-place-vX.Y.Z` lance `.github/workflows/numa-place-deb.yml`
 (Debian 13 : tests, construction, `dpkg-deb`/`lintian`, essai d'installation) et publie la
 Release `numa-place X.Y.Z` avec les trois `.deb` et `SHA256SUMS`.
-Construction locale, sans dpkg (paquets identiques au bit près à ceux de la CI) :
+Construction locale, sans dpkg. Même commit → mêmes `.deb` au bit près, quelle que soit la machine
+(tar non compressés : la sortie de gzip varie selon zlib / zlib-ng). Vérifier une Release :
 
 ```bash
 python3 packaging/build_deb.py --out dist
+```
+
+```bash
+gh release download numa-place-vX.Y.Z -p SHA256SUMS -D dist && git checkout numa-place-vX.Y.Z && \
+  SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python3 packaging/build_deb.py --version X.Y.Z --out dist && \
+  (cd dist && sha256sum -c SHA256SUMS)
 ```
 
 ## Installation (sur l'hôte, en root)
