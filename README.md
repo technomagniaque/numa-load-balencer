@@ -33,6 +33,31 @@ Place les vCPU **et** la mémoire de chaque VM/CT sur le(s) même(s) nœud(s) NU
 | `xcp-ng/xcpng-numa-place` | XCP-ng 8.3 : `VCPUs-params:mask` + tag `numa-auto` | 3.6+ |
 | `xen-libvirt/xen-numa-place` | Debian 13 dom0 + libvirt (libxl) : `<vcpu cpuset>` + `<metadata>` | 3.6+ |
 
+## Paquets .deb (Debian 13 et Proxmox VE)
+
+| Paquet | Pour | Contenu |
+|---|---|---|
+| `numa-place-common` | tous | `numa_core.py`, `numa_state.py` dans `/usr/lib/numa-place` |
+| `pve-numa-place` | Proxmox VE 8/9 | outil KVM + LXC, `/usr/sbin/pve-numa-place`, service + timer |
+| `xen-numa-place` | Debian 13 dom0 Xen + libvirt | outil Xen, `numa_xen.py`, service + timer |
+
+Les timers sont installés **sans être activés** : relire `… plan`, puis
+`systemctl enable --now pve-numa-place.timer pve-numa-place.service` (ou `xen-…`).
+XCP-ng (RPM, Python 3.6) garde l'installation manuelle ci-dessous.
+
+```bash
+apt install ./numa-place-common_*_all.deb ./pve-numa-place_*_all.deb
+```
+
+**Releases GitHub** : pousser un tag `numa-place-vX.Y.Z` lance `.github/workflows/numa-place-deb.yml`
+(Debian 13 : tests, construction, `dpkg-deb`/`lintian`, essai d'installation) et publie la
+Release `numa-place X.Y.Z` avec les trois `.deb` et `SHA256SUMS`.
+Construction locale, sans dpkg (paquets identiques au bit près à ceux de la CI) :
+
+```bash
+python3 numa/packaging/build_deb.py --out dist
+```
+
 ## Installation (sur l'hôte, en root)
 
 Copier le dossier `numa/` sur l'hôte, puis, selon la plateforme (`pve`, `xcp-ng` ou `xen-libvirt`) :
@@ -79,6 +104,9 @@ pve-numa-place status
 - Xen / XCP-ng : la mémoire suit l'affinité dure des vCPU (affinité de nœud déduite par Xen).
   Sur XCP-ng, si la politique NUMA de l'hôte est `best_effort`, vérifier avec `status` que la RAM
   est bien sur les nœuds du mask.
+- Réserve mémoire : sous Xen, la RAM du dom0 par nœud (cache 1 h) ; sous Proxmox, la RAM de
+  l'hôte hors invités (services, ARC ZFS) = utilisée − cache de pages − RAM des invités (cache 5 min).
+- Proxmox : les changements en attente (`[PENDING]`, VM en marche) comptent comme placement actuel.
 - Xen : le dom0 PV ne voit pas NUMA (`numa_node = -1`) ; le nœud des cartes vient de `xl info -n`.
   Une VF SR-IOV créée après le démarrage n'y figure pas : son nœud est celui de sa PF (lien sysfs `physfn`).
 - Chelsio T6 : les VF sont sous les PF 0-3 (`41:00.0`…), pas sous la PF4 qui porte le réseau.

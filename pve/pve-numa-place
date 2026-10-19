@@ -59,6 +59,8 @@ PROC = os.environ.get("PNP_PROC", "/proc")
 PVE = os.environ.get("PNP_PVE_DIR", "/etc/pve")
 RUN = os.environ.get("PNP_RUN_DIR", "/var/run")
 STATE = os.environ.get("PNP_STATE", "/var/lib/numa-place/pve-state.json")
+HOST_KEY = "__host__"      # entrée du fichier d'état : RAM de l'hôte hors invités
+HOST_MAX_AGE = 300.0       # recalculée toutes les 5 min (numa_maps de chaque VM)
 NODENAME = os.environ.get("PNP_NODENAME") or socket.gethostname().split(".")[0]
 
 TAG_AUTO = "numa-auto"
@@ -87,6 +89,36 @@ def _physical_cores(cpus: tuple[int, ...]) -> int:
         topo = f"{SYSFS}/devices/system/cpu/cpu{c}/topology"
         cores.add((_read(f"{topo}/physical_package_id"), _read(f"{topo}/core_id") or str(c)))
     return len(cores)
+
+
+def _node_meminfo(nid: int) -> dict[str, int]:
+    text = _read(f"{SYSFS}/devices/system/node/node{nid}/meminfo") or ""
+    return {k: int(v) // 1024 for k, v in re.findall(r"Node \d+ (\w+):\s+(\d+) kB", text)}
+
+
+def host_memory_mb(nodes: list[Node], guests: list[Guest]) -> dict[int, int]:
+    """RAM prise par l'hôte hors invités, par nœud (Mo) : l'équivalent Proxmox du dom0.
+
+    Mémoire utilisée du nœud, sans le cache de pages (récupérable), moins la RAM
+    des VM et conteneurs en marche sur ce nœud. Reste : services Proxmox, noyau,
+    et surtout l'ARC de ZFS, que le placement doit laisser libre."""
+    in_guests: dict[int, int] = {}
+    for g in guests:
+        pid = _qemu_pid(g.vmid) if g.kind == "qemu" else None
+        if g.kind == "qemu" and not pid:
+            continue
+        per_node = _numa_maps_mb(pid) if pid else _lxc_numa_mb(g.vmid)
+        for nid, mb in per_node.items():
+            in_guests[nid] = in_guests.get(nid, 0) + mb
+    out = {}
+    for n in nodes:
+        info = _node_meminfo(n.id)
+        if "MemFree" not in info:   # meminfo incomplet : ne rien réserver plutôt que tout
+            out[n.id] = 0
+            continue
+        used = info["MemTotal"] - info["MemFree"] - info.get("FilePages", 0)
+        out[n.id] = max(0, used - in_guests.get(n.id, 0))
+    return out
 
 
 def read_topology() -> list[Node]:
@@ -221,9 +253,34 @@ def guest_pci(kind: str, conf: dict) -> list[str]:
     return addrs
 
 
+PENDING_SECTIONS = ("[PENDING]", "[pve:pending]")  # KVM, LXC
+
+
+def with_pending(conf: dict, rest: list[str]) -> dict:
+    """Configuration effective : section principale + modifications en attente.
+
+    Sur une VM en marche, « qm set » range numaN (et parfois affinity) dans
+    [PENDING] jusqu'au redémarrage : sans cela l'outil croirait que la VM n'a pas
+    bougé, relancerait qm set à chaque passage et relancerait son délai."""
+    pending: list[str] = []
+    inside = False
+    for line in rest:
+        if line.startswith("["):
+            inside = line.strip() in PENDING_SECTIONS
+        elif inside:
+            pending.append(line)
+    if not pending:
+        return conf
+    changes = parse_main(pending)
+    deleted = {k.strip() for v in changes.pop("delete", []) for k in v.split(",")}
+    merged = {k: v for k, v in conf.items() if k not in deleted}
+    merged.update(changes)
+    return merged
+
+
 def load_guest(kind: str, path: str) -> Guest:
     main, rest = split_conf(_read(path) or "")
-    conf = parse_main(main)
+    conf = with_pending(parse_main(main), rest)
     get = lambda k, d: (conf.get(k) or [d])[0]  # noqa: E731
     mem = int(re.search(r"(\d+)", get("memory", "512")).group(1))
     if kind == "qemu":
@@ -377,7 +434,11 @@ def lxc_new_conf(p: Placement, g: Guest) -> str | None:
 
 
 def _run(cmd: list[str]) -> bool:
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError as exc:   # commande absente (qm, taskset…) : on journalise et on continue
+        log(f"échec {' '.join(cmd)} : {exc}")
+        return False
     if res.returncode != 0:
         log(f"échec {' '.join(cmd)} : {res.stderr.strip()}")
     return res.returncode == 0
@@ -388,7 +449,8 @@ def _qemu_pid(vmid: int) -> str | None:
     return pid if pid and os.path.isdir(f"{PROC}/{pid}") else None
 
 
-def apply_live(p: Placement, g: Guest, run=_run) -> None:
+def apply_live(p: Placement, g: Guest, run=None) -> None:
+    run = run or _run  # résolu à l'appel (remplaçable en test)
     cpus, mems = format_cpulist(p.cpus), format_cpulist(p.node_ids)
     if g.kind == "qemu":
         pid = _qemu_pid(g.vmid)
@@ -431,7 +493,8 @@ def _write_conf(p: Placement, g: Guest, run) -> bool | None:
     return True
 
 
-def apply_one(p: Placement, g: Guest, live: bool, run=_run) -> bool:
+def apply_one(p: Placement, g: Guest, live: bool, run=None) -> bool:
+    run = run or _run  # résolu à l'appel (remplaçable en test)
     if g.get("lock"):
         log(f"{g.vmid}: verrouillé ({g.get('lock')}), ignoré")
         return False
@@ -486,9 +549,10 @@ def actual_state(g: Guest) -> str:
 
 def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
                rebalance: bool = False, state: st.State | None = None,
-               now: float = 0.0) -> list[tuple[Guest, Placement]]:
+               now: float = 0.0, reserved_mb: dict[int, int] | None = None
+               ) -> list[tuple[Guest, Placement]]:
     reqs = [to_request(g, nodes, state, now) for g in guests]
-    placements = core.plan(nodes, reqs, cores_only, rebalance)
+    placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb)
     return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
 
 
@@ -519,10 +583,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # le plan porte toujours sur tous les invités, pour un équilibrage cohérent
     guests, now = load_guests(), time.time()
+    # RAM de l'hôte hors invités (services, ARC ZFS) réservée, comme le dom0 sous Xen
+    host, saved = st.cached(st.load(STATE), HOST_KEY, now, HOST_MAX_AGE,
+                            lambda: host_memory_mb(nodes, guests))
+    log("hôte : " + " ".join(f"N{k}={v}M" for k, v in sorted(host.items())))
     state = None
     if args.sample > 0 and args.cmd != "status":
-        state = st.smooth(st.load(STATE), measure_usage(guests, args.sample))
-    pairs = build_plan(nodes, guests, args.cores_only, args.rebalance, state, now)
+        state = st.smooth(saved, measure_usage(guests, args.sample))
+    pairs = build_plan(nodes, guests, args.cores_only, args.rebalance, state, now, host)
     selected = [(g, p) for g, p in pairs if not args.vmids or g.vmid in args.vmids]
     if args.cmd == "plan":
         show_plan(selected, state)
@@ -532,11 +600,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{g.kind:<4} {g.vmid:>6}  {actual_state(g)}")
         return 0
     ok = all([apply_one(p, g, args.live) for g, p in selected if p.nodes])
-    if state is not None:
-        moves = {str(g.vmid): (before, p.node_ids) for g, p in selected if p.nodes
-                 for before in [current_nodes(g, nodes)] if before not in ((), p.node_ids)}
-        boots = {str(g.vmid): boot_id(g) for g, _ in selected}
-        st.save(STATE, st.record_moves(state, moves, boots, now))
+    moves = {str(g.vmid): (before, p.node_ids) for g, p in selected if p.nodes
+             for before in [current_nodes(g, nodes)] if before not in ((), p.node_ids)}
+    boots = {str(g.vmid): boot_id(g) for g, _ in selected}
+    st.save(STATE, st.record_moves(state if state is not None else saved, moves, boots, now))
     return 0 if ok else 1
 
 

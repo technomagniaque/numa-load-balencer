@@ -12,6 +12,7 @@ import sys
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numa_core as core
+import numa_state as st
 
 Runner = Callable[[List[str]], Optional[str]]
 
@@ -141,13 +142,7 @@ def dom0_memory_cached(run: Runner, state: Dict[str, Dict[str, float]], now: flo
     « xl debug-keys u » écrit un rapport dans le journal de Xen (xl dmesg) ; le
     relancer toutes les 30 s noierait ce journal, alors que la RAM du dom0
     (dom0_mem fixe) ne bouge pas. Rend (mémoire, nouvel état)."""
-    cached = state.get(DOM0_KEY, {})
-    if cached and now - cached.get("at", 0.0) < max_age:
-        return {int(k): int(v) for k, v in cached.items() if k != "at"}, dict(state)
-    mem = dom0_memory(run)
-    entry = {str(k): float(v) for k, v in mem.items()}
-    entry["at"] = now
-    return mem, dict(state, **{DOM0_KEY: entry})
+    return st.cached(state, DOM0_KEY, now, max_age, lambda: dom0_memory(run))
 
 
 def pin_live(domain: str, cpus: Sequence[int], run: Runner = run_cmd) -> bool:

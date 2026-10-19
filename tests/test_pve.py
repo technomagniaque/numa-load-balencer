@@ -188,6 +188,68 @@ class PveTest(unittest.TestCase):
         idle = self.plan(cores_only=True, state={"100": {"ema": 0.2}, "101": {"ema": 0.5}}, now=1.0)
         self.assertEqual(idle[101][1].node_ids, (1,))
 
+    def test_pending_section_counts_as_current_placement(self):
+        # VM en marche : qm set a rangé affinity et numa0 dans [PENDING]
+        self.host.vm(100, "cores: 8\nmemory: 16384\nhostpci0: 0000:43:00.0\ntags: numa-auto\n"
+                          "\n[PENDING]\naffinity: 16-23,48-55\nnuma: 1\n"
+                          "numa0: cpus=0-7,hostnodes=2,memory=16384,policy=bind\ndelete: numa1\n")
+        g, p = self.plan()[100]
+        self.assertEqual(self.m.current_nodes(g, self.m.read_topology()), (2,))
+        self.assertEqual(self.m.qemu_changes(p, g), {})   # rien à refaire, pas de qm set en boucle
+
+    def test_pending_delete_removes_key(self):
+        conf = self.m.with_pending({"numa1": ["x"], "cores": ["4"]},
+                                   ["[snap]", "cores: 1", "[PENDING]", "delete: numa1", "cores: 8"])
+        self.assertEqual(conf, {"cores": ["8"]})
+
+    def test_host_memory_excludes_running_guests(self):
+        for n in range(4):
+            write(self.root / f"sys/devices/system/node/node{n}/meminfo",
+                  f"Node {n} MemTotal:       {32 * 1024 * 1024} kB\n"
+                  f"Node {n} MemFree:        {20 * 1024 * 1024} kB\n"
+                  f"Node {n} FilePages:      {2 * 1024 * 1024} kB\n")
+        self.host.vm(100, "cores: 2\nmemory: 4096\n")
+        write(self.root / "run/qemu-server/100.pid", "4242\n")
+        write(self.root / "proc/4242/numa_maps", "7f00 default anon=1 N0=1048576 kernelpagesize_kB=4\n")
+        host = self.m.host_memory_mb(self.m.read_topology(), self.m.load_guests())
+        self.assertEqual(host[0], 10 * 1024 - 4096)  # 32 - 20 libres - 2 cache - 4 de la VM
+        self.assertEqual(host[1], 10 * 1024)
+
+    def test_host_memory_without_memfree_reserves_nothing(self):
+        host = self.m.host_memory_mb(self.m.read_topology(), [])
+        self.assertEqual(set(host.values()), {0})
+
+    def test_main_measures_evacuates_and_saves_state(self):
+        from unittest import mock
+        self.host.vm(100, "cores: 16\nmemory: 16384\ntags: numa-auto\naffinity: 0-15,32-47\n")
+        self.host.ct(101, "cores: 2\nmemory: 1024\ntags: numa-auto\n"
+                          "lxc.cgroup2.cpuset.cpus: 8-15,40-47\nlxc.cgroup2.cpuset.mems: 1\n")
+        write(self.root / "run/qemu-server/100.pid", "4242\n")
+        (self.root / "proc/4242").mkdir(parents=True)        # VM en marche
+        tck = os.sysconf("SC_CLK_TCK")
+        stats = iter([0, 15 * 5 * tck])                    # 15 pCPU pendant 5 s
+        cg = self.root / "sys/fs/cgroup/lxc/101"
+        write(cg / "cpu.stat", "usage_usec 0\n")
+
+        def read(path, _orig=self.m._read):
+            if path.endswith("/4242/stat"):
+                ticks = next(stats)
+                write(cg / "cpu.stat", "usage_usec %d\n" % (0 if ticks == 0 else 2500000))
+                return "4242 (kvm) " + " ".join(["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 5)
+            return _orig(path)
+        self.m.STATE = str(self.root / "state.json")
+        with mock.patch.object(self.m, "_read", side_effect=read), mock.patch("time.sleep"), \
+                mock.patch.object(self.m, "_run", side_effect=fake_qm), \
+                mock.patch("time.monotonic", side_effect=[0.0, 5.0]), mock.patch("time.time", return_value=1000.0):
+            rc = self.m.main(["apply", "--cores-only", "--sample", "5"])
+        self.assertEqual(rc, 0)
+        state = self.m.st.load(self.m.STATE)
+        self.assertEqual(state["100"]["ema"], 15.0)
+        self.assertIn("__host__", state)
+        mems = re.search(r"cpuset.mems: (\S+)", (self.root / "pve/lxc/101.conf").read_text()).group(1)
+        self.assertIn(mems, ("2", "3"))                     # évacué loin de la grosse VM
+        self.assertEqual(state["101"]["home"], [1])
+
     def test_manual_and_opt_out_untouched(self):
         self.host.vm(400, "cores: 2\nmemory: 2048\naffinity: 0-3\n")
         self.host.vm(401, "cores: 2\nmemory: 2048\ntags: numa-manual\n")

@@ -99,6 +99,22 @@ def record_moves(state: Mapping[str, Mapping[str, object]],
     return out
 
 
+def cached(state: Mapping[str, Mapping[str, object]], key: str, now: float, max_age: float,
+           compute: Callable[[], Dict[int, int]]) -> Tuple[Dict[int, int], State]:
+    """Mémoire par nœud (Mo) gardée sous « key » dans l'état, recalculée après max_age s.
+
+    Sert à la réserve du dom0 Xen et de l'hôte Proxmox. Rend (valeur, nouvel état)."""
+    entry = state.get(key, {})
+    if entry and now - float(entry.get("at", 0.0)) < max_age:
+        return {int(k): int(v) for k, v in entry.items() if k != "at"}, {k: dict(v) for k, v in state.items()}
+    value = compute()
+    fresh = {str(k): float(v) for k, v in value.items()}
+    fresh["at"] = now
+    out = {k: dict(v) for k, v in state.items()}
+    out[key] = fresh
+    return value, out
+
+
 def measure(read_times: Callable[[], Dict[str, float]], seconds: float,
             sleep: Optional[Callable[[float], None]] = None,
             clock: Optional[Callable[[], float]] = None) -> Dict[str, float]:
