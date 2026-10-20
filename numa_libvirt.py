@@ -37,11 +37,13 @@ class Domain(NamedTuple):
 
     @property
     def guaranteed_mb(self) -> int:
-        return self.mem_min_mb or self.mem_mb
+        return self.mem_mb if not self.elastic else self.mem_min_mb
 
     @property
     def elastic(self) -> bool:
-        return 0 < self.mem_min_mb < self.mem_mb
+        # passthrough PCI : toute la RAM est allouée et verrouillée (pas de
+        # populate-on-demand sous Xen, DMA épinglé par VFIO) ; le ballooning ne rend rien.
+        return 0 < self.mem_min_mb < self.mem_mb and not self.pci
 
 
 def is_manual(dom: Domain) -> bool:

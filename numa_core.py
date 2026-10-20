@@ -209,6 +209,10 @@ def nodes_needed(req: Request, nodes: Sequence[Node], cores_only: bool) -> Optio
             break
     if k_cpu is None:
         return None
+    if req.pci_nodes:
+        # passthrough : les vCPU restent près de la carte ; la RAM qui ne tient pas
+        # déborde sur les nœuds voisins (policy preferred) plutôt que d'éloigner les vCPU
+        return k_cpu
     for k in range(k_cpu, len(nodes) + 1):
         if any(sum(n.mem_mb for n in w) * MEM_FIT >= req.mem_mb for w in windows(nodes, k)):
             return k

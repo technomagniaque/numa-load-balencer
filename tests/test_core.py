@@ -98,6 +98,15 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(p.policy, "preferred")
         self.assertIn("ballooning", p.reason)
 
+    def test_passthrough_vm_bigger_than_a_node_keeps_vcpus_on_the_card_node(self):
+        """P40 sur le nœud 3, 8 vCPU, 32 Go : la RAM déborde, les vCPU restent près de la carte."""
+        p = core.plan(epyc_7551p(), [req("p40", 8, 32, pci=[3])])["p40"]
+        self.assertEqual(p.node_ids, (3,))
+        self.assertEqual(p.policy, "preferred")
+
+    def test_vm_without_card_bigger_than_a_node_spans_two_nodes(self):
+        self.assertEqual(len(core.plan(epyc_7551p(), [req("big", 8, 32)])["big"].node_ids), 2)
+
     def test_fifty_ballooned_vms_spread_over_all_nodes(self):
         """50 VM à 2 Go garantis (128 Go de RAM) : toutes placées, réparties sur les 4 nœuds."""
         reqs = [req("vm%02d" % i, 2, 2, elastic=True) for i in range(50)]
@@ -107,9 +116,9 @@ class PlanTest(unittest.TestCase):
         self.assertLessEqual(max(per_node) - min(per_node), 1)
 
     def test_overcommitted_memory_falls_back_to_preferred(self):
-        out = core.plan(epyc_7551p(), [req("g", 8, 30, pci=[1]), req("h", 8, 20, pci=[1])])
-        self.assertEqual(out["g"].policy, "bind")
-        self.assertEqual(out["h"].policy, "preferred")
+        out = core.plan(epyc_7551p(), [req("g", 8, 20, pci=[1]), req("h", 8, 20, pci=[1])])
+        self.assertEqual((out["g"].node_ids, out["g"].policy), ((1,), "bind"))
+        self.assertEqual((out["h"].node_ids, out["h"].policy), ((1,), "preferred"))
 
 
 
