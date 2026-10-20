@@ -173,11 +173,18 @@ class Guest:
 
     @property
     def guaranteed_mb(self) -> int:
-        return self.mem_min_mb or self.mem_mb
+        return self.mem_mb if not self.elastic else self.mem_min_mb
 
     @property
     def elastic(self) -> bool:
-        return 0 < self.mem_min_mb < self.mem_mb
+        # passthrough PCI : toute la RAM est allouée et verrouillée (pas de
+        # populate-on-demand sous Xen, DMA épinglé par VFIO) ; le ballooning ne rend rien.
+        return 0 < self.mem_min_mb < self.mem_mb and not self.vfio
+
+    @property
+    def vfio(self) -> bool:
+        """VM KVM avec une carte PCI passée (VFIO)."""
+        return self.kind == "qemu" and (bool(self.pci) or any(re.fullmatch(r"hostpci\d+", k) for k in self.conf))
 
     def get(self, key: str) -> str | None:
         vals = self.conf.get(key)
