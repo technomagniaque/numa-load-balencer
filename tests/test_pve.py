@@ -118,12 +118,28 @@ class PveTest(unittest.TestCase):
         for vmid in (100, 101, 102):
             self.assertEqual(self.nodes_of(vmid), (2,), vmid)
 
-    def test_lxc_gpu_devices(self):
+    def test_lxc_devices_do_not_anchor_the_container(self):
+        """Un conteneur n a PAS de passthrough : il partage le noyau de l hote.
+
+        Un peripherique expose par chemin reste pilote par l hote, dans son
+        domaine IOMMU, avec ses interruptions la ou le noyau les a mises. Rien
+        n est epingle au conteneur : l ancrer sur le die de la carte ne gagnerait
+        rien et immobiliserait ses vCPU pour rien. Il est donc place a la charge,
+        comme n importe quel invite sans carte."""
         self.host.ct(200, "cores: 4\nmemory: 4096\ndev0: /dev/dri/renderD128,gid=104\n")
         self.host.ct(201, "cores: 4\nmemory: 4096\n"
                           "lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file\n")
-        self.assertEqual(self.nodes_of(200), (3,))
-        self.assertEqual(self.nodes_of(201), (2,))
+        for vmid in (200, 201):
+            g, p = self.plan()[vmid]
+            self.assertEqual(g.pci, (), f"CT {vmid} ne doit porter aucune carte")
+            self.assertFalse(self.m.has_passthrough(g), f"CT {vmid}")
+            self.assertTrue(p.nodes, f"CT {vmid} doit rester place")
+            self.assertIn("équilibrage", p.reason, f"CT {vmid} : {p.reason}")
+        # une VM KVM, elle, reste bien ancree sur le die de sa carte
+        self.host.vm(202, "cores: 4\nmemory: 4096\nhostpci0: 0000:43:00.0,pcie=1\n")
+        g, p = self.plan()[202]
+        self.assertEqual(p.node_ids, (2,), p.reason)
+        self.assertIn("passthrough", p.reason)
 
     def test_sixteen_vcpu_vm_spans_two_contiguous_nodes_in_cores_mode(self):
         self.host.vm(100, "sockets: 1\ncores: 16\nmemory: 16384\nhostpci0: 0000:43:00.0\n")
@@ -315,8 +331,13 @@ class PveTest(unittest.TestCase):
         cg.mkdir(parents=True)
         g, p = self.plan()[300]
         self.m.apply_one(p, g, live=True)
-        self.assertEqual((cg / "cpuset.cpus").read_text(), "24-31,56-63")
-        self.assertEqual((cg / "cpuset.mems").read_text(), "3")
+        # le conteneur n est plus ancre par son /dev/dri (voir
+        # test_lxc_devices_do_not_anchor_the_container) : il est place a la
+        # charge, donc on verifie la COHERENCE de l ecriture, pas un noeud fige.
+        self.assertEqual((cg / "cpuset.cpus").read_text(),
+                         self.m.format_cpulist(p.cpus))
+        self.assertEqual((cg / "cpuset.mems").read_text(),
+                         self.m.format_cpulist(p.node_ids))
 
     def test_live_qemu_with_vfio_does_not_migrate_memory(self):
         self.host.vm(100, "cores: 2\nmemory: 2048\nhostpci0: 0000:43:00.0\n"

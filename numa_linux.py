@@ -68,7 +68,11 @@ def read_topology(sysfs: str = "/sys") -> List[core.Node]:
         m = re.search(r"MemTotal:\s+(\d+)\s*kB", read(d + "/meminfo") or "")
         if cpus and m:   # nœud sans CPU (MCDRAM, CXL…) : ignoré
             threads = core.group_siblings(cpus, siblings(cpus, sysfs))
-            nodes.append(core.Node(nid, cpus, len(threads), int(m.group(1)) // 1024, threads))
+            # matrice de distances : c est elle qui definit « 1 saut NUMA ». Absente
+            # (ARM ancien, Xen sans cpu_topology), on retombera sur l adjacence des numeros.
+            dist = tuple(int(x) for x in (read(d + "/distance") or "").split() if x.isdigit())
+            nodes.append(core.Node(nid, cpus, len(threads), int(m.group(1)) // 1024,
+                                   threads, dist))
     return nodes
 
 

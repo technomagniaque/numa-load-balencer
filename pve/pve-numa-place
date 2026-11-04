@@ -211,16 +211,22 @@ def parse_main(lines: list[str]) -> dict:
 
 
 def guest_pci(kind: str, conf: dict) -> list[str]:
+    """Cartes PCI reellement PASSEES a l invite — KVM seulement.
+
+    🚨 Un conteneur LXC n a pas de passthrough : il partage le noyau de l hote.
+    Un peripherique expose par chemin (« dev0: path=/dev/dri/renderD128 ») reste
+    pilote PAR L HOTE, dans son domaine IOMMU, avec ses interruptions la ou le
+    noyau les a mises ; rien n est epingle au conteneur. L epingler sur le die de
+    la carte ne gagne donc rien et contraint l equilibrage pour rien — mesure sur
+    CT 129, 16 vCPU et 32 Go immobilises par la VGA du BMC (ASPEED 02:00.0).
+    Seul VFIO, c est-a-dire une VM KVM, justifie l ancrage sur un die.
+    """
     addrs: list[str] = []
+    if kind != "qemu":
+        return addrs
     for key, vals in conf.items():
-        if kind == "qemu" and re.fullmatch(r"hostpci\d+", key):
+        if re.fullmatch(r"hostpci\d+", key):
             addrs.extend(hostpci_addrs(vals[0]))
-        if kind == "lxc" and (re.fullmatch(r"dev\d+", key) or key == "lxc.mount.entry"):
-            for val in vals:
-                for dev in re.findall(r"/dev/(?:dri/(?:renderD|card)\d+|nvidia\d+)\b", val):
-                    addr = devnode_pci(dev)
-                    if addr and addr not in addrs:
-                        addrs.append(addr)
     return addrs
 
 
@@ -322,14 +328,14 @@ def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
 
 
 def has_passthrough(g: Guest) -> bool:
-    """Périphérique passé à l'invité, même si sa carte n'a pas pu être résolue
-    (mapping absent sur ce nœud, sysfs incomplet) : un tel invité ne doit jamais bouger."""
-    if g.pci:
-        return True
-    if g.kind == "qemu":
-        return any(re.fullmatch(r"hostpci\d+", k) for k in g.conf)
-    return any(re.search(r"/dev/(?:dri/|nvidia\d)", v) for k, vals in g.conf.items()
-               if re.fullmatch(r"dev\d+", k) or k == "lxc.mount.entry" for v in vals)
+    """Carte PASSEE a l invite, meme si son die n a pas pu etre resolu (mapping
+    absent sur ce noeud, sysfs incomplet) : un tel invite n est alors pas place
+    plutot que place au hasard.
+
+    LXC est exclu : voir guest_pci — un conteneur n a pas de passthrough."""
+    if g.kind != "qemu":
+        return False
+    return bool(g.pci) or any(re.fullmatch(r"hostpci\d+", k) for k in g.conf)
 
 
 def current_cpus(g: Guest) -> tuple[int, ...]:

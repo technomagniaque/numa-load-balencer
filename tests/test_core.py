@@ -172,7 +172,7 @@ class LoadBalancingTest(unittest.TestCase):
         out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 0.3),
                                         vm("xoce", 4, 2, [2], 0.5, home=(1,))])
         self.assertEqual(out["xoce"].node_ids, (1,))
-        self.assertIn("retour près de sa RAM (nœud(s) 1)", out["xoce"].reason)
+        self.assertIn("retour près de sa RAM (nœud(s) 1", out["xoce"].reason)
 
     def test_evacuated_vm_stays_away_while_big_vm_is_busy(self):
         out = core.plan(xcp_ng_epyc(), [vm("kdet1", 16, 16, [0, 1], 15.0),
@@ -193,11 +193,26 @@ class LoadBalancingTest(unittest.TestCase):
                                         vm("xoce", 4, 2, [2], 0.5, home=(1,), cooldown=True)])
         self.assertEqual(out["xoce"].node_ids, (2,))
 
-    def test_passthrough_vm_never_leaves_its_card_node(self):
+    def test_passthrough_vm_stays_on_its_card_node(self):
+        """Elle reste, meme sur un noeud charge : 5 coeurs sur 8 n est pas extreme."""
         for rebalance in (False, True):
-            out = core.plan(xcp_ng_epyc(), [vm("big", 8, 8, [3], 7.9),
+            out = core.plan(xcp_ng_epyc(), [vm("big", 8, 8, [3], 5.0),
                                             vm("gpu", 4, 8, [3], 0.3, pci=[3])], rebalance=rebalance)
             self.assertEqual(out["gpu"].node_ids, (3,), rebalance)
+
+    def test_passthrough_vm_leaves_only_under_extreme_load(self):
+        """Au-dela de PCI_EXTREME (6 coeurs sur 8 a 100 %) elle peut partir, mais
+        a 1 saut NUMA au plus. En dessous, elle ne bouge pas d un pouce."""
+        for usage, doit_rester in ((5.9, True), (6.0, False), (7.9, False)):
+            out = core.plan(xcp_ng_epyc(), [vm("big", 8, 8, [3], usage),
+                                            vm("gpu", 4, 8, [3], 0.3, pci=[3])])
+            ids = out["gpu"].node_ids
+            if doit_rester:
+                self.assertEqual(ids, (3,), f"{usage} coeurs : pas encore extreme")
+            else:
+                self.assertNotIn(3, ids, f"{usage} coeurs : le repli est permis")
+                self.assertTrue(all(core.hops(3, n, xcp_ng_epyc()) <= core.PCI_HOPS for n in ids),
+                                f"repli a plus d un saut : {ids}")
 
     def test_passthrough_vm_with_unknown_card_node_is_frozen(self):
         frozen = vm("vf", 4, 2, [1], 0.5)._replace(passthrough=True)

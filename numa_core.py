@@ -36,7 +36,21 @@ HOT_FRACTION = 0.5   # VM « chaude » : consomme au moins la moitié de ses vCP
 HOT_MIN = 2.0        # … et au moins 2 pCPU
 OVERLOAD = 0.85      # nœud saturé au-delà de 85 % de ses pCPU
 MOVE_GAIN = 1.0      # hystérésis : n'évacuer que si l'on gagne au moins 1 pCPU
-RETURN_LOAD = 0.60   # retour au nœud de sa RAM quand il redescend sous 60 % (< OVERLOAD)
+# Retour au nœud de sa RAM pour une VM SANS carte. Le seuil dépend du die visé :
+# un die qui SERT une carte PCIe est plus protégé — on n'y revient que s'il est
+# nettement libre, pour laisser la place à l'invité dont le lien y est attaché.
+RETURN_LOAD = 0.60          # die sans aucun passthrough
+RETURN_LOAD_PCI_DIE = 0.50  # die qui porte la carte d'un autre invité
+# Un invité à carte PCIe ne quitte son die QUE sous charge extrême : au moins 6 des
+# 8 cœurs du die à 100 %. Mesuré sur la consommation RÉELLE des invités qui sont
+# sur ce die, pas sur la charge que le calcul vient d'y poser — un invité à carte
+# est placé en premier, le contexte serait donc vide à ce moment-là.
+PCI_EXTREME = 6.0 / 8.0   # part des CŒURS du die occupés à 100 % : 6 sur 8
+PCI_RETURN = 0.70         # … et elle ne revient que sous 70 % : bande d'hystérésis
+PCI_HOPS = 1              # repli autorisé à 1 saut NUMA au plus, jamais au-delà
+# Sortir à 75 % et rentrer à 70 % laisse 5 points de marge. Sans cette bande, une
+# charge qui oscille autour du seuil ferait faire l'aller-retour à la VM, et chaque
+# aller-retour perd la localité de sa RAM — on paierait le remède plus que le mal.
 
 
 class Node(NamedTuple):
@@ -45,6 +59,7 @@ class Node(NamedTuple):
     cores: int       # cœurs physiques (threads SMT regroupés)
     mem_mb: int
     threads: Tuple[Tuple[int, ...], ...] = ()  # frères SMT de chaque cœur ; () = 1 thread/cœur
+    distances: Tuple[int, ...] = ()  # ligne du nœud dans la matrice NUMA ; () = inconnue
 
 
 class Request(NamedTuple):
@@ -167,8 +182,12 @@ class _Ctx(object):
     load[nid] = [Mo de RAM, pCPU sur le nœud, [pCPU par voie SMT]]"""
 
     def __init__(self, nodes: Sequence[Node], cores_only: bool, spread: bool,
-                 reserved_mb: Optional[Dict[int, int]]) -> None:
+                 reserved_mb: Optional[Dict[int, int]],
+                 measured: Optional[Dict[int, float]] = None,
+                 pci_dies: Optional[Iterable[int]] = None) -> None:
         self.nodes = list(nodes)
+        self.measured = dict(measured or {})
+        self.pci_dies = set(pci_dies or ())
         self.cores_only = cores_only
         self.spread = spread and any(smt_width(n) > 1 for n in nodes)
         self.load = {n.id: [float((reserved_mb or {}).get(n.id, 0)), 0.0, [0.0] * smt_width(n)]
@@ -181,9 +200,44 @@ class _Ctx(object):
     def node_capacity(self, node: Node) -> int:
         return node.cores if self.cores_only else len(node.cpus)
 
+    def return_load(self, ids: Iterable[int]) -> float:
+        """Seuil de retour : plus bas si l'un des nœuds visés porte une carte."""
+        return (RETURN_LOAD_PCI_DIE if any(i in self.pci_dies for i in ids)
+                else RETURN_LOAD)
+
+    def die_extreme(self, nid: int, moins: float = 0.0) -> Optional[float]:
+        """pCPU mesurés sur ce die s'il est sous charge extrême, sinon None.
+
+        `moins` retire la part d'un invité du calcul : un invité ne doit pas
+        pouvoir provoquer sa PROPRE expulsion. Ce qui décide, c'est la charge
+        que les AUTRES mettent sur le die — c'est elle qu'il ne pourra pas fuir
+        en restant, et celle qu'il soulage en partant."""
+        node = next((n for n in self.nodes if n.id == nid), None)
+        if node is None or nid not in self.measured:
+            return None
+        pris = self.measured[nid] - moins
+        return pris if pris >= PCI_EXTREME * node.cores else None
+
 
 def capacity(node: Node, cores_only: bool) -> int:
     return node.cores if cores_only else len(node.cpus)
+
+
+def hops(card: int, nid: int, nodes: Sequence[Node]) -> int:
+    """Sauts NUMA entre deux nœuds : 0 = le même, 1 = voisin, 2+ = plus loin.
+
+    La matrice `distance` du noyau décide quand elle est lue : « voisin » est la
+    plus petite distance non locale. Sur un bi-socket (16 intra, 32 inter) elle
+    exclut donc l'autre socket, ce que l'adjacence des numéros ne ferait pas.
+    Sans matrice, on retombe sur l'adjacence des numéros de nœud."""
+    if card == nid:
+        return 0
+    row = next((n.distances for n in nodes if n.id == card), ())
+    if row and max(card, nid) < len(row):
+        autres = sorted({d for i, d in enumerate(row) if i != card})
+        if autres:
+            return 1 if row[nid] <= autres[0] else 2
+    return 1 if abs(nid - card) == 1 else 2
 
 
 def cpu_weight(req: Request) -> float:
@@ -274,6 +328,55 @@ def _best(req: Request, cands: List[Tuple[Node, ...]], ctx: _Ctx, reason: str,
     return Placement(req.key, win, policy, reason + span + smt + balloon, lane)
 
 
+def _pci_repli(req: Request, card: int, cands: List[Tuple[Node, ...]],
+               ctx: _Ctx) -> Optional[Placement]:
+    """Sortie du die de la carte, et retour — les deux sous conditions.
+
+    Rend None quand l'invité doit être (re)placé sur le die de sa carte, c'est
+    le cas normal, et une Placement quand il doit rester ou aller ailleurs.
+
+    Sortir exige TOUT ceci :
+      - le die de la carte est à PCI_EXTREME de ses cœurs à 100 % (6 sur 8),
+        mesuré sur la consommation réelle des AUTRES invités qui y sont — un
+        invité ne provoque pas sa propre expulsion ;
+      - le repli est à PCI_HOPS saut NUMA au plus, jamais au-delà : un die à deux
+        sauts coûterait plus cher que la saturation qu'on fuit ;
+      - aucun nœud du repli n'est lui-même sous charge extrême.
+
+    Revenir n'arrive que sous PCI_RETURN (70 %). Entre 70 et 75 %, l'invité déjà
+    sorti RESTE où il est : c'est la bande d'hystérésis, sans quoi une charge qui
+    oscille autour du seuil lui ferait faire l'aller-retour indéfiniment.
+    """
+    node = next((n for n in ctx.nodes if n.id == card), None)
+    if node is None or not node.cores or card not in ctx.measured:
+        return None
+    part = (req.usage / len(req.current)) if (req.usage is not None and req.current) else 0.0
+    charge = ctx.measured[card] - (part if card in req.current else 0.0)
+    frac = charge / node.cores
+    loin = bool(req.current) and card not in req.current
+    rester = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
+
+    if loin and (req.cooldown or frac >= PCI_RETURN):
+        # déplacé à l'instant, ou die encore au-dessus du seuil de retour
+        if rester:
+            motif = ("déplacé récemment : on ne le rebouge pas" if req.cooldown else
+                     "die {} encore à {:.0%} : pas de retour avant {:.0%}".format(
+                         card, frac, PCI_RETURN))
+            return _best(req, rester, ctx, "hors du die de la carte, " + motif, req.lane)
+    if frac < PCI_EXTREME or req.cooldown:
+        return None                     # cas normal : le die de la carte
+    voisins = [w for w in cands
+               if card not in {n.id for n in w}
+               and all(hops(card, n.id, ctx.nodes) <= PCI_HOPS for n in w)
+               and all(ctx.die_extreme(n.id, part if n.id in req.current else 0.0) is None
+                       for n in w)]
+    if not voisins:
+        return None                     # nulle part de sain à 1 saut : on reste
+    return _best(req, voisins, ctx,
+                 "die {} de la carte saturé ({:.1f} cœurs sur {} à 100 %) :"
+                 " repli à 1 saut".format(card, charge, node.cores), req.lane)
+
+
 def place_one(req: Request, nodes: Sequence[Node], load: Optional[_Ctx] = None,
               cores_only: bool = False, rebalance: bool = False) -> Placement:
     ctx = load if isinstance(load, _Ctx) else _Ctx(nodes, cores_only, False, None)
@@ -290,12 +393,20 @@ def place_one(req: Request, nodes: Sequence[Node], load: Optional[_Ctx] = None,
         with_card = [w for w in cands if pci[0] in {n.id for n in w}]
         most = max(len(set(pci) & {n.id for n in w}) for w in with_card)
         best = [w for w in with_card if len(set(pci) & {n.id for n in w}) == most]
-        return _best(req, best, ctx, "passthrough nœud {}".format(pci[0]), req.lane)
-    if req.passthrough and req.current:
-        # carte présente mais nœud introuvable : on ne devine pas, la VM ne bouge jamais
+        repli = _pci_repli(req, pci[0], cands, ctx)
+        return repli or _best(req, best, ctx, "passthrough nœud {}".format(pci[0]), req.lane)
+    if req.passthrough:
+        # Carte présente mais nœud introuvable (numa_node = -1 : ACPI muet, machine
+        # mono-socket vue comme telle…). On ne devine pas le die : placer à la charge
+        # reviendrait à choisir au hasard le die d'une carte dont le lien PCIe est
+        # ailleurs, et à l'y laisser. La VM déjà placée est donc figée, et celle qui
+        # ne l'est pas n'est pas placée du tout — l'absence d'épinglage est le seul
+        # état honnête quand on ignore où est le lien.
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:
             return _best(req, same, ctx, "passthrough (nœud de la carte inconnu) : figé", req.lane)
+        return Placement(req.key, (), "",
+                         "passthrough : nœud de la carte inconnu, non placé")
     if req.auto and req.current and not rebalance:
         same = [w for w in cands if tuple(n.id for n in w) == tuple(sorted(req.current))]
         if same:
@@ -312,9 +423,11 @@ def _return_home(req: Request, cands: List[Tuple[Node, ...]], ctx: _Ctx) -> Opti
     win = [w for w in cands if tuple(n.id for n in w) == home]
     if not win:
         return None
-    label = "retour près de sa RAM (nœud(s) {})".format(format_cpulist(home))
+    label = "retour près de sa RAM (nœud(s) {}, seuil {:.0%})".format(
+        format_cpulist(home), ctx.return_load(home))
     back = _best(req, win, ctx, label)
-    return back if _peak(req, back.nodes, ctx, back.lane) <= RETURN_LOAD else None
+    seuil = ctx.return_load(home)
+    return back if _peak(req, back.nodes, ctx, back.lane) <= seuil else None
 
 
 def _keep_or_evacuate(req: Request, current: Tuple[Node, ...], cands: List[Tuple[Node, ...]],
@@ -350,12 +463,30 @@ def _add_load(ctx: _Ctx, req: Request, ids: Sequence[int], lane: int) -> None:
                 per_lane[j] += share / len(per_lane)
 
 
+def measured_load(reqs: Sequence[Request]) -> Dict[int, float]:
+    """pCPU réellement consommés sur chaque nœud, d'après OÙ SONT les invités.
+
+    On ne peut pas lire la charge d'un die dans le contexte de placement : un
+    invité à carte est placé en premier (c'est une ancre), le contexte est donc
+    encore vide quand on décide de son sort. La seule mesure honnête est celle
+    des invités là où ils se trouvent réellement, avant tout calcul."""
+    out = {}  # type: Dict[int, float]
+    for r in reqs:
+        if r.usage is None or not r.current:
+            continue
+        share = r.usage / len(r.current)
+        for nid in r.current:
+            out[nid] = out.get(nid, 0.0) + share
+    return out
+
+
 def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = False,
          rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None,
          spread: bool = False) -> Dict[str, Placement]:
     """reserved_mb : mémoire déjà prise par nœud hors invités (ex. dom0 Xen), en Mo.
     spread : une voie SMT par VM (jamais deux threads d'un même cœur dans une VM)."""
-    ctx = _Ctx(nodes, cores_only, spread, reserved_mb)
+    ctx = _Ctx(nodes, cores_only, spread, reserved_mb, measured_load(reqs),
+               {n for r in reqs for n in r.pci_nodes})
     for r in reqs:
         if r.manual and r.current:
             _add_load(ctx, r, r.current, r.lane)
