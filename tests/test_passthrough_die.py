@@ -3,13 +3,14 @@
 La regle, telle que le proprietaire du lab l a fixee :
 
   - il ne quitte JAMAIS le die ou le lien PCIe est attache, sauf si ce die est a
-    au moins PCI_EXTREME de ses coeurs a 100 % — 6 sur 8 ici ;
-  - le repli est a PCI_HOPS = 1 saut NUMA au plus. Sur un bi-socket, « 1 saut »
-    exclut l autre socket : c est la matrice de distances du noyau qui tranche,
-    pas l adjacence des numeros de noeud ;
-  - il revient des que le die retombe sous PCI_RETURN = 70 %. Entre 70 et 75 %
-    il reste ou il est : sans cette bande, une charge qui oscille autour du seuil
-    lui ferait faire l aller-retour, et chaque aller-retour perd sa localite.
+    au moins PCI_EXTREME de ses coeurs a 100 % — 5 sur 6 (83,3 %) ici ;
+  - le repli est a PCI_HOPS = 1 saut NUMA au plus. Sur un bi-socket multi-dies,
+    « 1 saut » exclut l autre socket : c est la matrice de distances du noyau qui
+    tranche, pas l adjacence des numeros de noeud ;
+  - il revient des que le die retombe sous PCI_RETURN = 4/6 (66,7 %). Entre
+    66,7 % et 83,3 % il reste ou il est : sans cette bande, une charge qui
+    oscille autour du seuil lui ferait faire l aller-retour, et chaque
+    aller-retour perd sa localite.
 
 Et pour un invite SANS carte, le seuil de retour vers la RAM depend du die vise :
 60 % pour un die ordinaire, 50 % pour un die qui porte la carte d un autre — on
@@ -71,8 +72,9 @@ class DieTest(unittest.TestCase):
             got = self.place([carte(), voisine("gros", 2, 5.0)], rebalance=rebalance)
             self.assertEqual(got["132"].node_ids, (2,), got["132"].reason)
 
-    def test_le_seuil_de_sortie_est_6_coeurs_sur_8(self):
-        for usage, reste in ((5.0, True), (5.9, True), (6.0, False), (7.9, False)):
+    def test_le_seuil_de_sortie_est_5_sur_6(self):
+        # 5/6 de 8 coeurs = 6,666... : 6,6 reste, 6,7 sort
+        for usage, reste in ((5.0, True), (6.6, True), (6.7, False), (7.9, False)):
             got = self.place([carte(), voisine("gros", 2, usage)])
             ids = got["132"].node_ids
             if reste:
@@ -100,15 +102,15 @@ class DieTest(unittest.TestCase):
         for n in ids:
             self.assertEqual(core.hops(2, n, bisocket()), 1, f"{n} est a 2 sauts")
 
-    # ------------------------------------------- hysteresis : sortie 75, retour 70
-    def test_entre_70_et_75_il_reste_ou_il_est(self):
-        for usage in (5.6, 5.9):   # 70 % et 73,75 % de 8 coeurs
+    # --------------------------------- hysteresis : sortie 5/6 (83,3 %), retour 4/6 (66,7 %)
+    def test_entre_retour_et_sortie_il_reste_ou_il_est(self):
+        for usage in (5.4, 6.6):   # 67,5 % et 82,5 % de 8 coeurs
             got = self.place([carte(current=(1,)), voisine("gros", 2, usage)])
             self.assertEqual(got["132"].node_ids, (1,),
-                             f"{usage} coeurs : pas de retour avant 70 % — {got['132'].reason}")
+                             f"{usage} coeurs : pas de retour avant 67 % — {got['132'].reason}")
 
-    def test_sous_70_il_revient_sur_le_die_de_la_carte(self):
-        got = self.place([carte(current=(1,)), voisine("gros", 2, 5.5)])  # 68,75 %
+    def test_sous_retour_il_revient_sur_le_die_de_la_carte(self):
+        got = self.place([carte(current=(1,)), voisine("gros", 2, 5.3)])  # 66,25 % < 4/6
         self.assertEqual(got["132"].node_ids, (2,), got["132"].reason)
         self.assertIn("passthrough", got["132"].reason)
 

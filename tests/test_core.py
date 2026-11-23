@@ -201,9 +201,9 @@ class LoadBalancingTest(unittest.TestCase):
             self.assertEqual(out["gpu"].node_ids, (3,), rebalance)
 
     def test_passthrough_vm_leaves_only_under_extreme_load(self):
-        """Au-dela de PCI_EXTREME (6 coeurs sur 8 a 100 %) elle peut partir, mais
-        a 1 saut NUMA au plus. En dessous, elle ne bouge pas d un pouce."""
-        for usage, doit_rester in ((5.9, True), (6.0, False), (7.9, False)):
+        """Au-dela de PCI_EXTREME (5/6 des coeurs a 100 %, soit 6,67 sur 8) elle peut
+        partir, mais a 1 saut NUMA au plus. En dessous, elle ne bouge pas d un pouce."""
+        for usage, doit_rester in ((6.6, True), (6.7, False), (7.9, False)):
             out = core.plan(xcp_ng_epyc(), [vm("big", 8, 8, [3], usage),
                                             vm("gpu", 4, 8, [3], 0.3, pci=[3])])
             ids = out["gpu"].node_ids

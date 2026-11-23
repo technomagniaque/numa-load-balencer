@@ -84,6 +84,32 @@ def pci_node(addr: str, sysfs: str = "/sys") -> Optional[int]:
     return int(raw)
 
 
+def shared_pci_ioh(sysfs: str = "/sys") -> bool:
+    """Vrai si tous les périphériques PCIe passent par un seul IOH partagé entre sockets
+    (ex. Intel 5520 / 5500 sur Dell R710 : un seul complexe racine d'E/S, tous les
+    numa_node à -1). Faux dès qu'un périphérique a un nœud NUMA connu ou que plusieurs
+    complexes racine portent des E/S (EPYC, Xeon bi-socket à PCIe intégré)."""
+    pci_devs = glob.glob(sysfs + "/bus/pci/devices/*")
+    if not pci_devs:
+        return False
+    for d in pci_devs:
+        raw = read(d + "/numa_node")
+        if raw is not None:
+            try:
+                if int(raw.strip()) >= 0:
+                    return False
+            except ValueError:
+                pass
+    io_roots = set()
+    for rb in glob.glob(sysfs + "/devices/pci*"):
+        for dev in glob.glob(rb + "/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*"):
+            cls = (read(dev + "/class") or "").strip().lower()
+            # 0x0600xx = pont hôte (ex. bus uncore fe/ff des Xeon 5500/5600)
+            if cls and not cls.startswith("0x0600"):
+                io_roots.add(rb)
+    return len(io_roots) == 1
+
+
 def node_meminfo(nid: int, sysfs: str = "/sys") -> Dict[str, int]:
     text = read("{}/devices/system/node/node{}/meminfo".format(sysfs, nid)) or ""
     return {k: int(v) // 1024 for k, v in re.findall(r"Node \d+ (\w+):\s+(\d+) kB", text)}

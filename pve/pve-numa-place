@@ -316,7 +316,7 @@ def current_nodes(g: Guest, nodes: list[Node]) -> tuple[int, ...]:
 
 
 def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
-               now: float = 0.0) -> Request:
+               now: float = 0.0, pci_shared: bool = False) -> Request:
     pci_nodes = tuple(n for n in (pci_node(a) for a in g.pci) if n is not None)
     key = str(g.vmid)
     usage = st.usage(state, key) if state is not None else None
@@ -324,7 +324,7 @@ def to_request(g: Guest, nodes: list[Node], state: st.State | None = None,
     home = st.home(state, key, boot_id(g)) if state is not None else ()
     return Request(key, g.vcpus, g.guaranteed_mb, pci_nodes, current_nodes(g, nodes),
                    is_auto(g), is_manual(g), g.elastic, usage, cooling, home,
-                   core.lane_of(current_cpus(g), nodes), has_passthrough(g))
+                   core.lane_of(current_cpus(g), nodes), has_passthrough(g), pci_shared)
 
 
 def has_passthrough(g: Guest) -> bool:
@@ -535,7 +535,8 @@ def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
                rebalance: bool = False, state: st.State | None = None,
                now: float = 0.0, reserved_mb: dict[int, int] | None = None,
                spread: bool = False) -> list[tuple[Guest, Placement]]:
-    reqs = [to_request(g, nodes, state, now) for g in guests]
+    shared_ioh = linux.shared_pci_ioh(SYSFS)
+    reqs = [to_request(g, nodes, state, now, shared_ioh) for g in guests]
     placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
     return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
 

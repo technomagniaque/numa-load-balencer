@@ -31,25 +31,25 @@ le comportement est celui d'un placement par nœud entier.
 """
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-MEM_FIT = 0.90  # part max de la RAM d'un nœud qu'on accepte de lier (policy bind)
+MEM_FIT = 0.98  # part max de la RAM d'un nœud qu'on accepte de lier (policy bind)
 HOT_FRACTION = 0.5   # VM « chaude » : consomme au moins la moitié de ses vCPU…
 HOT_MIN = 2.0        # … et au moins 2 pCPU
-OVERLOAD = 0.85      # nœud saturé au-delà de 85 % de ses pCPU
+OVERLOAD = 0.80      # nœud saturé au-delà de 80 % de ses pCPU (4,8 / 6 sur R710 → dès 5 cœurs)
 MOVE_GAIN = 1.0      # hystérésis : n'évacuer que si l'on gagne au moins 1 pCPU
-# Retour au nœud de sa RAM pour une VM SANS carte. Le seuil dépend du die visé :
-# un die qui SERT une carte PCIe est plus protégé — on n'y revient que s'il est
-# nettement libre, pour laisser la place à l'invité dont le lien y est attaché.
-RETURN_LOAD = 0.60          # die sans aucun passthrough
-RETURN_LOAD_PCI_DIE = 0.50  # die qui porte la carte d'un autre invité
-# Un invité à carte PCIe ne quitte son die QUE sous charge extrême : au moins 6 des
-# 8 cœurs du die à 100 %. Mesuré sur la consommation RÉELLE des invités qui sont
-# sur ce die, pas sur la charge que le calcul vient d'y poser — un invité à carte
-# est placé en premier, le contexte serait donc vide à ce moment-là.
-PCI_EXTREME = 6.0 / 8.0   # part des CŒURS du die occupés à 100 % : 6 sur 8
-PCI_RETURN = 0.70         # … et elle ne revient que sous 70 % : bande d'hystérésis
-PCI_HOPS = 1              # repli autorisé à 1 saut NUMA au plus, jamais au-delà
-# Sortir à 75 % et rentrer à 70 % laisse 5 points de marge. Sans cette bande, une
-# charge qui oscille autour du seuil ferait faire l'aller-retour à la VM, et chaque
+# Retour au nœud de sa RAM pour une VM SANS carte. Le seuil dépend du die/socket visé :
+# un nœud qui SERT une carte PCIe est plus protégé — on n'y revient que s'il est
+# nettement libre, pour laisser la place à l'invité dont le lien ou la RAM VFIO y est.
+RETURN_LOAD = 0.60          # nœud sans aucun passthrough
+RETURN_LOAD_PCI_DIE = 0.50  # nœud qui porte un invité passthrough
+# Un invité à carte PCIe ne quitte son nœud QUE sous charge extrême : au moins 5 des
+# 6 cœurs du socket à 100 % (adapté au Dell R710 2×6 cœurs). Mesuré sur la consommation
+# RÉELLE des invités qui sont sur ce nœud, pas sur la charge que le calcul vient d'y
+# poser — un invité à carte est placé en premier, le contexte serait donc vide à ce moment-là.
+PCI_EXTREME = 5.0 / 6.0   # part des CŒURS du nœud occupés à 100 % : 5 sur 6 (83,3 %)
+PCI_RETURN = 4.0 / 6.0    # … et elle ne revient que sous 4 sur 6 (66,7 %) : bande d'hystérésis
+PCI_HOPS = 1              # repli autorisé à 1 saut NUMA au plus (sur bi-socket 10/20 : l'autre socket)
+# Sortir à 5/6 (83,3 %) et rentrer à 4/6 (66,7 %) laisse 1 cœur complet de marge. Sans cette
+# bande, une charge qui oscille autour du seuil ferait faire l'aller-retour à la VM, et chaque
 # aller-retour perd la localité de sa RAM — on paierait le remède plus que le mal.
 
 
@@ -76,6 +76,7 @@ class Request(NamedTuple):
     home: Tuple[int, ...] = ()   # nœud(s) où se trouve sa RAM après une évacuation
     lane: int = -1               # voie SMT actuelle (-1 : nœuds entiers ou inconnue)
     passthrough: bool = False    # a un périphérique PCI (GPU, VF…), même si son nœud est inconnu
+    pci_shared: bool = False     # IOH PCIe unique partagé entre sockets (ex. Intel 5520 du R710)
 
 
 class Placement(NamedTuple):
@@ -263,9 +264,10 @@ def nodes_needed(req: Request, nodes: Sequence[Node], cores_only: bool) -> Optio
             break
     if k_cpu is None:
         return None
-    if req.pci_nodes:
-        # passthrough : les vCPU restent près de la carte ; la RAM qui ne tient pas
-        # déborde sur les nœuds voisins (policy preferred) plutôt que d'éloigner les vCPU
+    if req.pci_nodes or (req.passthrough and req.pci_shared):
+        # passthrough : les vCPU restent sur le plus petit nombre de nœuds (près de la
+        # carte, ou sur 1 socket sur IOH partagé) ; la RAM qui ne tient pas déborde
+        # sur les nœuds voisins (policy preferred) plutôt que d'éloigner les vCPU
         return k_cpu
     for k in range(k_cpu, len(nodes) + 1):
         if any(sum(n.mem_mb for n in w) * MEM_FIT >= req.mem_mb for w in windows(nodes, k)):
@@ -336,16 +338,16 @@ def _pci_repli(req: Request, card: int, cands: List[Tuple[Node, ...]],
     le cas normal, et une Placement quand il doit rester ou aller ailleurs.
 
     Sortir exige TOUT ceci :
-      - le die de la carte est à PCI_EXTREME de ses cœurs à 100 % (6 sur 8),
+      - le nœud de la carte est à PCI_EXTREME de ses cœurs à 100 % (5 sur 6),
         mesuré sur la consommation réelle des AUTRES invités qui y sont — un
         invité ne provoque pas sa propre expulsion ;
-      - le repli est à PCI_HOPS saut NUMA au plus, jamais au-delà : un die à deux
+      - le repli est à PCI_HOPS saut NUMA au plus, jamais au-delà : un nœud à deux
         sauts coûterait plus cher que la saturation qu'on fuit ;
       - aucun nœud du repli n'est lui-même sous charge extrême.
 
-    Revenir n'arrive que sous PCI_RETURN (70 %). Entre 70 et 75 %, l'invité déjà
-    sorti RESTE où il est : c'est la bande d'hystérésis, sans quoi une charge qui
-    oscille autour du seuil lui ferait faire l'aller-retour indéfiniment.
+    Revenir n'arrive que sous PCI_RETURN (4/6 = 66,7 %). Entre 66,7 % et 83,3 %,
+    l'invité déjà sorti RESTE où il est : c'est la bande d'hystérésis, sans quoi une
+    charge qui oscille autour du seuil lui ferait faire l'aller-retour indéfiniment.
     """
     node = next((n for n in ctx.nodes if n.id == card), None)
     if node is None or not node.cores or card not in ctx.measured:
@@ -395,6 +397,19 @@ def place_one(req: Request, nodes: Sequence[Node], load: Optional[_Ctx] = None,
         best = [w for w in with_card if len(set(pci) & {n.id for n in w}) == most]
         repli = _pci_repli(req, pci[0], cands, ctx)
         return repli or _best(req, best, ctx, "passthrough nœud {}".format(pci[0]), req.lane)
+    if req.passthrough and req.pci_shared:
+        # IOH PCIe unique partagé symétriquement entre les sockets (ex. Intel 5520 du R710) :
+        # toutes les cartes ont numa_node = -1 car le lien est équidistant de chaque socket.
+        # La 1re passe place la VM sur le socket le moins chargé ; ensuite sa RAM VFIO reste
+        # ancrée sur son socket d'origine (home après repli, sinon current), qu'elle ne quitte
+        # que sous charge extrême (PCI_EXTREME).
+        anchor = next((n for n in (req.home or req.current) if n in known), None)
+        if anchor is not None:
+            with_anchor = [w for w in cands if anchor in {n.id for n in w}]
+            repli = _pci_repli(req, anchor, cands, ctx)
+            return repli or _best(req, with_anchor, ctx,
+                                  "passthrough (IOH partagé) nœud {}".format(anchor), req.lane)
+        return _best(req, cands, ctx, "passthrough (IOH partagé)", req.lane)
     if req.passthrough:
         # Carte présente mais nœud introuvable (numa_node = -1 : ACPI muet, machine
         # mono-socket vue comme telle…). On ne devine pas le die : placer à la charge
@@ -485,20 +500,26 @@ def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = Fals
          spread: bool = False) -> Dict[str, Placement]:
     """reserved_mb : mémoire déjà prise par nœud hors invités (ex. dom0 Xen), en Mo.
     spread : une voie SMT par VM (jamais deux threads d'un même cœur dans une VM)."""
-    ctx = _Ctx(nodes, cores_only, spread, reserved_mb, measured_load(reqs),
-               {n for r in reqs for n in r.pci_nodes})
+    pci_dies = {n for r in reqs for n in r.pci_nodes}
+    for r in reqs:
+        if not r.pci_nodes and r.passthrough and r.pci_shared:
+            pci_dies.update(r.home or r.current)
+    ctx = _Ctx(nodes, cores_only, spread, reserved_mb, measured_load(reqs), pci_dies)
     for r in reqs:
         if r.manual and r.current:
             _add_load(ctx, r, r.current, r.lane)
     kept = lambda r: r.auto and bool(r.current) and not rebalance  # noqa: E731
+    is_pci = lambda r: bool(r.pci_nodes) or (r.passthrough and r.pci_shared)  # noqa: E731
     # d'abord les ancres (carte, VM chaudes), puis les plus gros consommateurs :
     # les petites VM sont jugées contre la charge réelle déjà posée
-    order = sorted(reqs, key=lambda r: (not r.pci_nodes, not is_hot(r), not kept(r),
+    order = sorted(reqs, key=lambda r: (not is_pci(r), not is_hot(r), not kept(r),
                                         -cpu_weight(r), -r.vcpus, -r.mem_mb, r.key))
     out = {}  # type: Dict[str, Placement]
     for r in order:
         p = place_one(r, nodes, ctx, cores_only, rebalance)
         if p.nodes:
             _add_load(ctx, r, p.node_ids, p.lane)
+            if is_pci(r) and not r.pci_nodes:
+                ctx.pci_dies.update(p.node_ids)
         out[r.key] = p
     return out

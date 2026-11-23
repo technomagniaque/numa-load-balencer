@@ -108,7 +108,7 @@ def host_memory(nodes: List[core.Node], vms: List[Vm]) -> Dict[int, int]:
 # ---------------------------------------------------------------- placement
 
 def to_request(vm: Vm, nodes: List[core.Node], state: Optional[st.State] = None,
-               now: float = 0.0) -> core.Request:
+               now: float = 0.0, pci_shared: bool = False) -> core.Request:
     found = (linux.pci_node(a, SYSFS) for a in vm.pci)
     cards = tuple(n for n in found if n is not None)
     current = core.nodes_of_cpus(vm.cpuset, nodes) if vm.cpuset else ()
@@ -117,14 +117,15 @@ def to_request(vm: Vm, nodes: List[core.Node], state: Optional[st.State] = None,
     home = st.home(state, vm.name, vm.domid) if state is not None else ()
     return core.Request(vm.name, vm.vcpus, vm.guaranteed_mb, cards, current,
                         vm.mode == "auto", lv.is_manual(vm), vm.elastic, usage, cooling, home,
-                        core.lane_of(vm.cpuset, nodes), bool(vm.pci))
+                        core.lane_of(vm.cpuset, nodes), bool(vm.pci), pci_shared)
 
 
 def build_plan(nodes: List[core.Node], vms: List[Vm], cores_only: bool = False,
                rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None,
                state: Optional[st.State] = None, now: float = 0.0,
                spread: bool = False) -> List[Tuple[Vm, core.Placement]]:
-    reqs = [to_request(vm, nodes, state, now) for vm in vms]
+    shared_ioh = linux.shared_pci_ioh(SYSFS)
+    reqs = [to_request(vm, nodes, state, now, shared_ioh) for vm in vms]
     placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
     return [(vm, placements[vm.name]) for vm in sorted(vms, key=lambda v: v.name)]
 
