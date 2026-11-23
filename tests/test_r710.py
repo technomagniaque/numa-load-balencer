@@ -3,6 +3,7 @@ SMT desactive, 12 coeurs, 32 Go/socket) + chipset Intel 5520 IOH unique partage.
 
     python3 tests/test_r710.py
 """
+import errno
 import importlib.machinery
 import importlib.util
 import os
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 NUMA_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(NUMA_DIR))
@@ -381,14 +383,20 @@ class PciIrqSplitTest(unittest.TestCase):
             host = FakeR710Host(root)
             self._setup_r710_irqs(host)
             host.bind_irqs("0000:04:00.0", "nvme", (49,), msi=True, current_aff="0,2,4,6,8,10")
-            ro = root / "proc/irq/49/smp_affinity_list"
-            ro.chmod(0o444)
-            try:
-                nodes = r710_nodes()
-                irq_plan = linux.plan_pci_irqs(
-                    nodes, {"0000:06:00.6": (0, 2, 4, 6), "0000:03:00.0": (0, 2, 4, 6)},
-                    shared_ioh=True, sysfs=str(root / "sys"), host_irq_cpus=(1, 3),
-                )
+            ro = str(root / "proc/irq/49/smp_affinity_list")
+            real_open = open
+
+            def fake_open(file, mode="r", *args, **kwargs):
+                if str(file) == ro and "w" in mode:
+                    raise OSError(errno.EIO, "Input/output error")
+                return real_open(file, mode, *args, **kwargs)
+
+            nodes = r710_nodes()
+            irq_plan = linux.plan_pci_irqs(
+                nodes, {"0000:06:00.6": (0, 2, 4, 6), "0000:03:00.0": (0, 2, 4, 6)},
+                shared_ioh=True, sysfs=str(root / "sys"), host_irq_cpus=(1, 3),
+            )
+            with mock.patch("builtins.open", side_effect=fake_open):
                 changed, skipped = linux.apply_pci_irqs(irq_plan, str(root / "proc"))
                 self.assertEqual(changed, 16)
                 self.assertEqual(skipped, 1)
@@ -400,8 +408,6 @@ class PciIrqSplitTest(unittest.TestCase):
                 changed2, skipped2 = linux.apply_pci_irqs(irq_plan, str(root / "proc"))
                 self.assertEqual(changed2, 0)
                 self.assertEqual(skipped2, 1)
-            finally:
-                ro.chmod(0o644)
 
     def test_pve_apply_pci_irqs_end_to_end_multi_vm_et_isolation_coeurs(self):
         with tempfile.TemporaryDirectory() as tmp:
