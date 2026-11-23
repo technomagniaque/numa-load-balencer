@@ -120,6 +120,21 @@ def to_request(vm: Vm, nodes: List[core.Node], state: Optional[st.State] = None,
                         core.lane_of(vm.cpuset, nodes), bool(vm.pci), pci_shared)
 
 
+def _isolate_on_shared_ioh(
+    nodes: List[core.Node],
+    vms: List[Vm],
+    placements: Dict[str, core.Placement],
+) -> Tuple[Dict[str, core.Placement], Tuple[int, ...]]:
+    vm_keys = {vm.name for vm in vms}
+    pt_keys = {vm.name for vm in vms if vm.pci}
+    vcpus_by_key = {vm.name: vm.vcpus for vm in vms}
+    manual_vm_cpus = {vm.name: vm.cpuset for vm in vms if lv.is_manual(vm) and vm.cpuset}
+    return core.isolate_vm_cores(
+        nodes, placements, vcpus_by_key, vm_keys, pt_keys,
+        host_irq_cores=core.HOST_IRQ_CORES, manual_vm_cpus=manual_vm_cpus,
+    )
+
+
 def build_plan(nodes: List[core.Node], vms: List[Vm], cores_only: bool = False,
                rebalance: bool = False, reserved_mb: Optional[Dict[int, int]] = None,
                state: Optional[st.State] = None, now: float = 0.0,
@@ -127,6 +142,8 @@ def build_plan(nodes: List[core.Node], vms: List[Vm], cores_only: bool = False,
     shared_ioh = linux.shared_pci_ioh(SYSFS)
     reqs = [to_request(vm, nodes, state, now, shared_ioh) for vm in vms]
     placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
+    if shared_ioh:
+        placements, _ = _isolate_on_shared_ioh(nodes, vms, placements)
     return [(vm, placements[vm.name]) for vm in sorted(vms, key=lambda v: v.name)]
 
 
@@ -165,6 +182,35 @@ def apply_one(vm: Vm, p: core.Placement, live: bool, run: linux.Runner = linux.r
 
 
 # ---------------------------------------------------------------- CLI
+
+def pci_irq_targets(pairs: List[Tuple[Vm, core.Placement]],
+                    running_only: bool = True) -> Dict[str, Tuple[int, ...]]:
+    """Associe chaque carte PCIe passée à une VM KVM aux CPU cibles de cette VM."""
+    targets = {}  # type: Dict[str, Tuple[int, ...]]
+    for vm, p in pairs:
+        if not vm.pci or (running_only and not vm.running):
+            continue
+        cpus = p.cpus if p.nodes else vm.cpuset
+        if not cpus:
+            continue
+        for addr in vm.pci:
+            targets[addr] = cpus
+    return targets
+
+
+def apply_pci_irqs(nodes: List[core.Node],
+                   pairs: List[Tuple[Vm, core.Placement]]) -> Tuple[int, int]:
+    shared_ioh = linux.shared_pci_ioh(SYSFS)
+    targets = pci_irq_targets(pairs, running_only=True)
+    host_cpus = None  # type: Optional[Tuple[int, ...]]
+    if shared_ioh:
+        _, host_cpus = _isolate_on_shared_ioh(nodes, [v for v, _ in pairs],
+                                              {v.name: p for v, p in pairs})
+    if not targets and not host_cpus:
+        return 0, 0
+    irq_plan = linux.plan_pci_irqs(nodes, targets, shared_ioh, SYSFS, host_irq_cpus=host_cpus)
+    return linux.apply_pci_irqs(irq_plan, PROC)
+
 
 def show_plan(pairs: List[Tuple[Vm, core.Placement]], state: Optional[st.State] = None) -> None:
     for vm, p in pairs:
@@ -225,6 +271,11 @@ def main(argv: Optional[List[str]] = None, run: linux.Runner = linux.run_cmd) ->
         show_status(selected)
         return 0
     results = [apply_one(vm, p, args.live, run) for vm, p in selected if p.nodes]
+    if args.live:
+        changed, skipped = apply_pci_irqs(nodes, pairs)
+        if changed or skipped:
+            extra = " ({} managées ignorées)".format(skipped) if skipped else ""
+            log("IRQ PCIe : {} mise(s) à jour{}".format(changed, extra))
     moves = {vm.name: (before, p.node_ids) for vm, p in selected if p.nodes and vm.cpuset
              for before in [core.nodes_of_cpus(vm.cpuset, nodes)] if before != p.node_ids}
     boots = {vm.name: vm.domid for vm, _ in selected}

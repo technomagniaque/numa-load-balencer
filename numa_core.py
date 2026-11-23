@@ -48,6 +48,7 @@ RETURN_LOAD_PCI_DIE = 0.50  # nœud qui porte un invité passthrough
 PCI_EXTREME = 5.0 / 6.0   # part des CŒURS du nœud occupés à 100 % : 5 sur 6 (83,3 %)
 PCI_RETURN = 4.0 / 6.0    # … et elle ne revient que sous 4 sur 6 (66,7 %) : bande d'hystérésis
 PCI_HOPS = 1              # repli autorisé à 1 saut NUMA au plus (sur bi-socket 10/20 : l'autre socket)
+HOST_IRQ_CORES = 2        # cœurs dédiés aux IRQ PCIe hôtes sur IOH partagé (jamais de VM KVM dessus)
 # Sortir à 5/6 (83,3 %) et rentrer à 4/6 (66,7 %) laisse 1 cœur complet de marge. Sans cette
 # bande, une charge qui oscille autour du seuil ferait faire l'aller-retour à la VM, et chaque
 # aller-retour perd la localité de sa RAM — on paierait le remède plus que le mal.
@@ -85,6 +86,7 @@ class Placement(NamedTuple):
     policy: str                  # "bind" | "preferred" | ""
     reason: str
     lane: int = -1               # voie SMT attribuée (-1 : tous les threads des nœuds)
+    pinned_cpus: Tuple[int, ...] = ()  # sous-ensemble exact de CPU (ex. isolation IRQ hôte)
 
     @property
     def node_ids(self) -> Tuple[int, ...]:
@@ -92,6 +94,8 @@ class Placement(NamedTuple):
 
     @property
     def cpus(self) -> Tuple[int, ...]:
+        if self.pinned_cpus:
+            return self.pinned_cpus
         if self.lane < 0:
             return tuple(sorted(c for n in self.nodes for c in n.cpus))
         return tuple(sorted(c for n in self.nodes for c in lane_cpus(n, self.lane)))
@@ -523,3 +527,144 @@ def plan(nodes: Sequence[Node], reqs: Sequence[Request], cores_only: bool = Fals
                 ctx.pci_dies.update(p.node_ids)
         out[r.key] = p
     return out
+
+
+def _node_core_groups(node: Node) -> Tuple[Tuple[int, ...], ...]:
+    """Cœurs physiques du nœud (chaque cœur = tuple trié de ses threads SMT)."""
+    if node.threads:
+        return node.threads
+    return tuple((c,) for c in sorted(node.cpus))
+
+
+def _split_count(total: int, parts: int) -> List[int]:
+    base, extra = divmod(total, parts)
+    return [base + (1 if i < extra else 0) for i in range(parts)]
+
+
+def isolate_vm_cores(
+    nodes: Sequence[Node],
+    placements: Dict[str, Placement],
+    vcpus_by_key: Dict[str, int],
+    vm_keys: Iterable[str],
+    passthrough_keys: Iterable[str] = (),
+    host_irq_cores: int = HOST_IRQ_CORES,
+    manual_vm_cpus: Optional[Dict[str, Tuple[int, ...]]] = None,
+) -> Tuple[Dict[str, Placement], Tuple[int, ...]]:
+    """Attribue des cœurs précis à chaque VM KVM et réserve des cœurs dédiés aux IRQ hôtes.
+
+    Invariants garantis :
+      - jamais un cœur attribué à une VM KVM ne figure dans `host_irq_cpus` ;
+      - les conteneurs LXC (absents de `vm_keys`) gardent tous les cœurs de leur socket ;
+      - sur un hôte avec VM passthrough, les cœurs IRQ hôtes sont pris en priorité
+        sur un socket SANS VM passthrough (jusqu'à `host_irq_cores`, ex. 2 cœurs sur
+        le socket opposé du R710), sinon sur les cœurs laissés libres hors VM KVM ;
+      - plusieurs VM KVM sur un même socket reçoivent des cœurs disjoints dès que
+        la capacité du socket le permet (pour envoyer les IRQ VFIO de chaque VM
+        strictement sur SES propres cœurs).
+    """
+    vms = set(vm_keys)
+    pt = set(passthrough_keys)
+    manual = {k: tuple(sorted(set(v))) for k, v in (manual_vm_cpus or {}).items() if v}
+
+    groups = {n.id: _node_core_groups(n) for n in nodes}
+
+    # Cœurs physiques déjà pris par des VM KVM épinglées manuellement
+    manual_core_idx = {n.id: set() for n in nodes}  # type: Dict[int, set]
+    pt_nodes = set()  # type: set
+    for k, cpus in manual.items():
+        if k in pt:
+            pt_nodes.update(nodes_of_cpus(cpus, nodes))
+        cpu_set = set(cpus)
+        for n in nodes:
+            for ci, grp in enumerate(groups[n.id]):
+                if cpu_set & set(grp):
+                    manual_core_idx[n.id].add(ci)
+
+    # Besoins en cœurs par nœud pour chaque VM KVM placée
+    vm_needs = {}  # type: Dict[str, Dict[int, int]]
+    max_need = {n.id: 0 for n in nodes}  # type: Dict[int, int]
+    for k, p in placements.items():
+        if k not in vms or not p.nodes:
+            continue
+        if k in pt:
+            pt_nodes.update(p.node_ids)
+        vcpus = max(1, int(vcpus_by_key.get(k, 1)))
+        shares = _split_count(vcpus, len(p.node_ids))
+        vm_needs[k] = {}
+        for nid, share in zip(p.node_ids, shares):
+            cap = len(groups[nid])
+            need = min(share, cap)
+            vm_needs[k][nid] = need
+            if need > max_need[nid]:
+                max_need[nid] = need
+
+    # 1) Réserver jusqu'à host_irq_cores cœurs dédiés aux IRQ hôtes (hors toute VM KVM)
+    reserved_idx = {n.id: [] for n in nodes}  # type: Dict[int, List[int]]
+    free_manual = {
+        n.id: [ci for ci in range(len(groups[n.id])) if ci not in manual_core_idx[n.id]]
+        for n in nodes
+    }
+    slack = {n.id: max(0, len(free_manual[n.id]) - max_need[n.id]) for n in nodes}
+
+    non_pt = [n.id for n in sorted(nodes, key=lambda x: x.id) if n.id not in pt_nodes]
+    remaining = max(0, host_irq_cores)
+    # Priorité 1 : sockets SANS VM passthrough (marge maximale d'abord)
+    for nid in sorted(non_pt, key=lambda i: (-slack[i], i)):
+        if remaining <= 0 or slack[nid] <= 0:
+            continue
+        take = min(remaining, slack[nid])
+        reserved_idx[nid].extend(free_manual[nid][:take])
+        remaining -= take
+
+    # Priorité 2 : si aucun cœur n'a pu être réservé sur les sockets sans passthrough
+    # (ex. tous les sockets portent une VM passthrough), prendre des cœurs libres hors VM KVM
+    if remaining == max(0, host_irq_cores):
+        others = [n.id for n in sorted(nodes, key=lambda x: x.id) if n.id in pt_nodes]
+        for nid in sorted(others, key=lambda i: (-slack[i], i)):
+            if remaining <= 0 or slack[nid] <= 0:
+                continue
+            take = min(remaining, slack[nid])
+            reserved_idx[nid].extend(free_manual[nid][:take])
+            remaining -= take
+
+    host_irq_cpus = tuple(sorted(
+        groups[nid][ci][0]
+        for nid in sorted(reserved_idx)
+        for ci in reserved_idx[nid]
+    ))
+
+    # 2) Attribuer des cœurs précis (hors reserved_idx) à chaque VM KVM
+    vm_pool = {
+        n.id: [ci for ci in range(len(groups[n.id])) if ci not in set(reserved_idx[n.id])]
+        for n in nodes
+    }
+    core_use = {n.id: {ci: (1 if ci in manual_core_idx[n.id] else 0) for ci in vm_pool[n.id]}
+                for n in nodes}
+
+    # VM passthrough d'abord, puis plus grosses VM en vCPU : garantit des cœurs disjoints
+    ordered_vms = sorted(
+        vm_needs.keys(),
+        key=lambda k: (k not in pt, -vcpus_by_key.get(k, 1), k),
+    )
+    out = dict(placements)
+    for k in ordered_vms:
+        p = placements[k]
+        chosen_cpus = []  # type: List[int]
+        for nid in p.node_ids:
+            pool = vm_pool[nid]
+            if not pool:
+                continue
+            need = min(vm_needs[k][nid], len(pool))
+            picked = sorted(pool, key=lambda ci: (core_use[nid][ci], ci))[:need]
+            for ci in picked:
+                core_use[nid][ci] += 1
+                grp = groups[nid][ci]
+                if p.lane >= 0:
+                    chosen_cpus.append(grp[p.lane % len(grp)])
+                else:
+                    chosen_cpus.extend(grp)
+        pinned = tuple(sorted(set(chosen_cpus)))
+        if pinned:
+            out[k] = p._replace(pinned_cpus=pinned)
+
+    return out, host_irq_cpus

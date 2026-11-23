@@ -84,6 +84,24 @@ class FakeR710Host:
         write(self.root / f"sys/devices/{root_bus}/{addr}/numa_node", f"{numa_node}\n")
         write(self.root / f"sys/bus/pci/devices/{addr}/numa_node", f"{numa_node}\n")
 
+    def bind_irqs(self, addr: str, driver: str, irqs: tuple[int, ...], msi: bool = True,
+                  current_aff: str = "0-11") -> None:
+        dev = self.root / f"sys/bus/pci/devices/{addr}"
+        dev.mkdir(parents=True, exist_ok=True)
+        drv_dir = self.root / f"sys/bus/pci/drivers/{driver}"
+        drv_dir.mkdir(parents=True, exist_ok=True)
+        link = dev / "driver"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(drv_dir)
+        if msi and irqs:
+            for irq in irqs:
+                write(dev / f"msi_irqs/{irq}", "msix\n")
+        elif irqs:
+            write(dev / "irq", f"{irqs[0]}\n")
+        for irq in irqs:
+            write(self.root / f"proc/irq/{irq}/smp_affinity_list", f"{current_aff}\n")
+
     def vm(self, vmid: int, body: str) -> Path:
         p = self.root / f"pve/qemu-server/{vmid}.conf"
         write(p, body)
@@ -226,16 +244,203 @@ class PveR710EndToEndTest(unittest.TestCase):
             self.assertEqual([(n.id, n.cores, len(n.cpus), n.distances) for n in nodes],
                              [(0, 6, 6, (10, 20)), (1, 6, 6, (20, 10))])
             plan = {g.vmid: (g, p) for g, p in m.build_plan(nodes, m.load_guests(), spread=True)}
-            # VM 101 (passthrough sur IOH partage) est placee sur socket 0 (ancre), PAS ignoree
+            # VM 101 (passthrough sur IOH partage, 4 vCPU) : exactement 4 coeurs sur socket 0
             self.assertEqual(plan[101][1].node_ids, (0,))
-            self.assertEqual(plan[101][1].cpus, (0, 2, 4, 6, 8, 10))
+            self.assertEqual(plan[101][1].cpus, (0, 2, 4, 6))
             self.assertEqual(plan[101][1].policy, "bind")
             self.assertIn("IOH partagé", plan[101][1].reason)
-            # CT 100 et VM 102 vont sur socket 1 (socket 0 deja a 30/32 Go),
-            # puis CT 106 (2 vCPU, 1 Go) equilibre sur socket 0 (6 vCPU vs 10 vCPU sur socket 1)
-            self.assertEqual(plan[100][1].node_ids, (1,))
+            # Socket 1 : 2 coeurs (1,3) dedies aux IRQ hotes ; VM 102 (KVM 4 vCPU) prend 5,7,9,11
+            host_irqs = m.host_irq_cpus_for(nodes, list(plan.values()))
+            self.assertEqual(host_irqs, (1, 3))
             self.assertEqual(plan[102][1].node_ids, (1,))
+            self.assertEqual(plan[102][1].cpus, (5, 7, 9, 11))
+            # Jamais de chevauchement entre un coeur VM KVM et un coeur IRQ hote
+            kvm_cpus = set(plan[101][1].cpus) | set(plan[102][1].cpus)
+            self.assertTrue(set(host_irqs).isdisjoint(kvm_cpus))
+            # Les conteneurs LXC (CT 100 et CT 106) conservent tous les coeurs de leur socket
+            self.assertEqual(plan[100][1].node_ids, (1,))
+            self.assertEqual(plan[100][1].cpus, (1, 3, 5, 7, 9, 11))
             self.assertEqual(plan[106][1].node_ids, (0,))
+            self.assertEqual(plan[106][1].cpus, (0, 2, 4, 6, 8, 10))
+
+
+class PciIrqSplitTest(unittest.TestCase):
+    def _setup_r710_irqs(self, host: FakeR710Host):
+        # Cartes passthrough VM 101 (vfio-pci)
+        host.bind_irqs("0000:06:00.6", "vfio-pci", (115, 116, 117, 118, 119, 120), msi=True)
+        host.bind_irqs("0000:03:00.0", "vfio-pci", (114,), msi=False)
+        # Carte vfio-pci pour une 2e VM passthrough (VM 105)
+        host.bind_irqs("0000:06:00.1", "vfio-pci", (200, 201, 202, 203, 204, 205), msi=True)
+        # Cartes hotes non-passthrough (qede, bnx2, ata_piix)
+        host.bind_irqs("0000:06:00.0", "qede", (51, 52, 53, 54, 55, 56), msi=True)
+        host.bind_irqs("0000:06:00.7", "qede", (381, 382), msi=True)
+        host.bind_irqs("0000:00:1f.2", "ata_piix", (23,), msi=False)
+
+    def test_une_vm_passthrough_envoie_vfio_sur_ses_coeurs_et_hote_sur_2_coeurs_dedies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = FakeR710Host(root)
+            self._setup_r710_irqs(host)
+            nodes = r710_nodes()
+            vm101_cpus = (0, 2, 4, 6)
+            host_cpus = (1, 3)
+            irq_plan = linux.plan_pci_irqs(
+                nodes,
+                {"0000:06:00.6": vm101_cpus, "0000:03:00.0": vm101_cpus},
+                shared_ioh=True,
+                sysfs=str(root / "sys"),
+                host_irq_cpus=host_cpus,
+            )
+            # VM 101 : 06:00.6 en round-robin strictement sur ses 4 coeurs (0,2,4,6), jamais 8/10
+            self.assertEqual([irq_plan[q] for q in (115, 116, 117, 118, 119, 120)],
+                             [(0,), (2,), (4,), (6,), (0,), (2,)])
+            self.assertEqual(irq_plan[114], vm101_cpus)
+            # Cartes hotes non-passthrough -> exclusivement sur les 2 coeurs dedies (1,3)
+            self.assertEqual([irq_plan[q] for q in (51, 52, 53, 54, 55, 56)],
+                             [(1,), (3,), (1,), (3,), (1,), (3,)])
+            self.assertEqual(irq_plan[381], (1,))
+            self.assertEqual(irq_plan[382], (3,))
+            self.assertEqual(irq_plan[23], host_cpus)
+            # Carte vfio-pci inactive (06:00.1) non touchee
+            self.assertNotIn(200, irq_plan)
+
+    def test_deux_vm_passthrough_sur_meme_socket_recoivent_coeurs_et_irq_disjoints(self):
+        nodes = r710_nodes()
+        reqs = [
+            shared_vfio("101", vcpus=4, mem_mb=14000, current=(0,)),
+            shared_vfio("105", vcpus=2, mem_mb=8000, current=(0,)),
+            guest("102", vcpus=4, mem_mb=16384, current=(1,)),
+        ]
+        raw = core.plan(nodes, reqs)
+        iso, host_cpus = core.isolate_vm_cores(
+            nodes, raw, {"101": 4, "105": 2, "102": 4},
+            vm_keys={"101", "105", "102"}, passthrough_keys={"101", "105"},
+        )
+        # Sur socket 0 : VM 101 = (0,2,4,6), VM 105 = (8,10) -> strictement disjoints
+        self.assertEqual(iso["101"].cpus, (0, 2, 4, 6))
+        self.assertEqual(iso["105"].cpus, (8, 10))
+        # Sur socket 1 (sans passthrough) : 2 coeurs IRQ hotes (1,3), VM 102 = (5,7,9,11)
+        self.assertEqual(host_cpus, (1, 3))
+        self.assertEqual(iso["102"].cpus, (5, 7, 9, 11))
+        all_vm_cpus = set(iso["101"].cpus) | set(iso["105"].cpus) | set(iso["102"].cpus)
+        self.assertTrue(set(host_cpus).isdisjoint(all_vm_cpus))
+
+    def test_deux_vm_passthrough_sur_deux_sockets_jamais_irq_hote_sur_coeur_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = FakeR710Host(root)
+            self._setup_r710_irqs(host)
+            nodes = r710_nodes()
+            reqs = [
+                shared_vfio("101", vcpus=4, mem_mb=20480, current=(0,)),
+                shared_vfio("105", vcpus=4, mem_mb=20480, current=(1,)),
+            ]
+            raw = core.plan(nodes, reqs)
+            iso, host_cpus = core.isolate_vm_cores(
+                nodes, raw, {"101": 4, "105": 4},
+                vm_keys={"101", "105"}, passthrough_keys={"101", "105"},
+            )
+            # 2 coeurs libres hors VM KVM reserves pour les IRQ hotes
+            self.assertEqual(len(host_cpus), 2)
+            all_vm_cpus = set(iso["101"].cpus) | set(iso["105"].cpus)
+            self.assertTrue(set(host_cpus).isdisjoint(all_vm_cpus))
+            irq_plan = linux.plan_pci_irqs(
+                nodes,
+                {"0000:06:00.6": iso["101"].cpus, "0000:03:00.0": iso["101"].cpus,
+                 "0000:06:00.1": iso["105"].cpus},
+                shared_ioh=True, sysfs=str(root / "sys"), host_irq_cpus=host_cpus,
+            )
+            # Chaque IRQ VFIO tombe exactement sur un coeur de SA VM
+            for q in (114, 115, 116, 117, 118, 119, 120):
+                self.assertTrue(set(irq_plan[q]).issubset(set(iso["101"].cpus)))
+            for q in (200, 201, 202, 203, 204, 205):
+                self.assertTrue(set(irq_plan[q]).issubset(set(iso["105"].cpus)))
+            # Chaque IRQ hote tombe strictement sur un coeur HORS VM KVM
+            for q in (23, 51, 52, 381, 382):
+                self.assertTrue(set(irq_plan[q]).issubset(set(host_cpus)))
+                self.assertTrue(set(irq_plan[q]).isdisjoint(all_vm_cpus))
+
+    def test_aucun_coeur_libre_hors_vm_ne_place_pas_irq_hote_sur_coeur_vm(self):
+        nodes = r710_nodes()
+        reqs = [
+            shared_vfio("101", vcpus=6, mem_mb=20480, current=(0,)),
+            guest("102", vcpus=6, mem_mb=20480, current=(1,)),
+        ]
+        raw = core.plan(nodes, reqs)
+        iso, host_cpus = core.isolate_vm_cores(
+            nodes, raw, {"101": 6, "102": 6},
+            vm_keys={"101", "102"}, passthrough_keys={"101"},
+        )
+        self.assertEqual(host_cpus, ())
+        self.assertEqual(iso["101"].cpus, (0, 2, 4, 6, 8, 10))
+        self.assertEqual(iso["102"].cpus, (1, 3, 5, 7, 9, 11))
+
+    def test_apply_pci_irqs_est_idempotent_et_ignore_irq_managees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = FakeR710Host(root)
+            self._setup_r710_irqs(host)
+            host.bind_irqs("0000:04:00.0", "nvme", (49,), msi=True, current_aff="0,2,4,6,8,10")
+            ro = root / "proc/irq/49/smp_affinity_list"
+            ro.chmod(0o444)
+            try:
+                nodes = r710_nodes()
+                irq_plan = linux.plan_pci_irqs(
+                    nodes, {"0000:06:00.6": (0, 2, 4, 6), "0000:03:00.0": (0, 2, 4, 6)},
+                    shared_ioh=True, sysfs=str(root / "sys"), host_irq_cpus=(1, 3),
+                )
+                changed, skipped = linux.apply_pci_irqs(irq_plan, str(root / "proc"))
+                self.assertEqual(changed, 16)
+                self.assertEqual(skipped, 1)
+                self.assertEqual((root / "proc/irq/115/smp_affinity_list").read_text().strip(), "0")
+                self.assertEqual((root / "proc/irq/114/smp_affinity_list").read_text().strip(), "0,2,4,6")
+                self.assertEqual((root / "proc/irq/51/smp_affinity_list").read_text().strip(), "1")
+                self.assertEqual((root / "proc/irq/52/smp_affinity_list").read_text().strip(), "3")
+                self.assertEqual((root / "proc/irq/23/smp_affinity_list").read_text().strip(), "1,3")
+                changed2, skipped2 = linux.apply_pci_irqs(irq_plan, str(root / "proc"))
+                self.assertEqual(changed2, 0)
+                self.assertEqual(skipped2, 1)
+            finally:
+                ro.chmod(0o644)
+
+    def test_pve_apply_pci_irqs_end_to_end_multi_vm_et_isolation_coeurs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = FakeR710Host(root)
+            self._setup_r710_irqs(host)
+            # VM 101 (4 vCPU, passthrough socket 0) + VM 102 (4 vCPU, socket 1) + CT 100 (6 vCPU, LXC)
+            host.vm(101, "sockets: 1\ncores: 4\nmemory: 30720\nnuma: 1\n"
+                         "hostpci0: 0000:06:00.6,pcie=1\nhostpci1: 0000:03:00.0,pcie=1\n")
+            host.vm(102, "sockets: 1\ncores: 4\nmemory: 16384\nnuma: 1\n")
+            host.ct(100, "cores: 6\nmemory: 16384\n")
+            write(root / "run/qemu-server/101.pid", "1001\n")
+            (root / "proc/1001").mkdir(parents=True)
+            write(root / "run/qemu-server/102.pid", "1002\n")
+            (root / "proc/1002").mkdir(parents=True)
+
+            m = load_pve(dict(
+                PNP_SYSFS=str(root / "sys"), PNP_PROC=str(root / "proc"),
+                PNP_PVE_DIR=str(root / "pve"), PNP_RUN_DIR=str(root / "run"),
+                PNP_NODENAME="pve",
+            ))
+            nodes = m.read_topology()
+            pairs = m.build_plan(nodes, m.load_guests(), spread=True)
+            by_id = {g.vmid: p for g, p in pairs}
+            self.assertEqual(by_id[101].cpus, (0, 2, 4, 6))
+            self.assertEqual(by_id[102].cpus, (5, 7, 9, 11))
+            self.assertEqual(by_id[100].cpus, (1, 3, 5, 7, 9, 11))
+
+            changed, skipped = m.apply_pci_irqs(nodes, pairs)
+            self.assertEqual(skipped, 0)
+            self.assertEqual(changed, 16)
+            # VFIO VM 101 -> uniquement sur 0,2,4,6
+            self.assertEqual((root / "proc/irq/114/smp_affinity_list").read_text().strip(), "0,2,4,6")
+            self.assertEqual((root / "proc/irq/115/smp_affinity_list").read_text().strip(), "0")
+            self.assertEqual((root / "proc/irq/118/smp_affinity_list").read_text().strip(), "6")
+            # IRQ hotes -> uniquement sur 1,3 (hors VM 101 et hors VM 102)
+            self.assertEqual((root / "proc/irq/51/smp_affinity_list").read_text().strip(), "1")
+            self.assertEqual((root / "proc/irq/52/smp_affinity_list").read_text().strip(), "3")
+            self.assertEqual((root / "proc/irq/23/smp_affinity_list").read_text().strip(), "1,3")
 
 
 if __name__ == "__main__":

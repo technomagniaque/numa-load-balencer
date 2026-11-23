@@ -531,6 +531,27 @@ def actual_state(g: Guest) -> str:
 
 # ---------------------------------------------------------------- CLI
 
+def _isolate_on_shared_ioh(
+    nodes: list[Node],
+    guests: list[Guest],
+    placements: dict[str, Placement],
+) -> tuple[dict[str, Placement], tuple[int, ...]]:
+    """Sur IOH PCIe unique partagé, isole les cœurs de chaque VM KVM (hors LXC)
+    et réserve core.HOST_IRQ_CORES cœurs dédiés aux IRQ PCIe hôtes."""
+    vm_keys = {str(g.vmid) for g in guests if g.kind == "qemu"}
+    pt_keys = {str(g.vmid) for g in guests if g.kind == "qemu" and has_passthrough(g)}
+    vcpus_by_key = {str(g.vmid): g.vcpus for g in guests}
+    manual_vm_cpus = {
+        str(g.vmid): current_cpus(g)
+        for g in guests
+        if g.kind == "qemu" and is_manual(g) and current_cpus(g)
+    }
+    return core.isolate_vm_cores(
+        nodes, placements, vcpus_by_key, vm_keys, pt_keys,
+        host_irq_cores=core.HOST_IRQ_CORES, manual_vm_cpus=manual_vm_cpus,
+    )
+
+
 def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
                rebalance: bool = False, state: st.State | None = None,
                now: float = 0.0, reserved_mb: dict[int, int] | None = None,
@@ -538,7 +559,73 @@ def build_plan(nodes: list[Node], guests: list[Guest], cores_only: bool = False,
     shared_ioh = linux.shared_pci_ioh(SYSFS)
     reqs = [to_request(g, nodes, state, now, shared_ioh) for g in guests]
     placements = core.plan(nodes, reqs, cores_only, rebalance, reserved_mb, spread)
+    if shared_ioh:
+        placements, _ = _isolate_on_shared_ioh(nodes, guests, placements)
     return [(g, placements[str(g.vmid)]) for g in sorted(guests, key=lambda g: g.vmid)]
+
+
+def pci_irq_targets(pairs: list[tuple[Guest, Placement]],
+                    running_only: bool = True) -> dict[str, tuple[int, ...]]:
+    """Associe chaque carte PCIe passée à une VM KVM aux cœurs exacts de cette VM."""
+    targets: dict[str, tuple[int, ...]] = {}
+    for g, p in pairs:
+        if g.kind != "qemu" or not g.pci:
+            continue
+        if running_only and not _qemu_pid(g.vmid):
+            continue
+        cpus = p.cpus if p.nodes else current_cpus(g)
+        if not cpus:
+            continue
+        for addr in g.pci:
+            targets[addr] = cpus
+    return targets
+
+
+def host_irq_cpus_for(nodes: list[Node],
+                      pairs: list[tuple[Guest, Placement]]) -> tuple[int, ...] | None:
+    """Cœurs dédiés aux IRQ PCIe hôtes (jamais partagés avec une VM KVM) sur IOH partagé."""
+    if not linux.shared_pci_ioh(SYSFS):
+        return None
+    guests = [g for g, _ in pairs]
+    placements = {str(g.vmid): p for g, p in pairs}
+    _, host_cpus = _isolate_on_shared_ioh(nodes, guests, placements)
+    return host_cpus
+
+
+def apply_pci_irqs(nodes: list[Node],
+                   pairs: list[tuple[Guest, Placement]]) -> tuple[int, int]:
+    """Dirige les IRQ VFIO vers les cœurs exacts de leur VM et (sur IOH partagé)
+    les IRQ PCIe hôtes non-passthrough vers les cœurs dédiés sans VM KVM."""
+    shared_ioh = linux.shared_pci_ioh(SYSFS)
+    targets = pci_irq_targets(pairs, running_only=True)
+    host_cpus = host_irq_cpus_for(nodes, pairs) if shared_ioh else None
+    if not targets and not host_cpus:
+        return 0, 0
+    irq_plan = linux.plan_pci_irqs(nodes, targets, shared_ioh, SYSFS, host_irq_cpus=host_cpus)
+    return linux.apply_pci_irqs(irq_plan, PROC)
+
+
+def show_pci_irq_plan(nodes: list[Node], pairs: list[tuple[Guest, Placement]]) -> None:
+    shared_ioh = linux.shared_pci_ioh(SYSFS)
+    targets = pci_irq_targets(pairs, running_only=False)
+    host_cpus = host_irq_cpus_for(nodes, pairs) if shared_ioh else None
+    if not targets and host_cpus is None:
+        return
+    parts: list[str] = []
+    if targets:
+        per_vm = ", ".join(
+            f"{addr}->cpus {format_cpulist(cpus)} (nœud {format_cpulist(core.nodes_of_cpus(cpus, nodes))})"
+            for addr, cpus in sorted(targets.items())
+        )
+        parts.append(f"vfio: {per_vm}")
+    if shared_ioh:
+        if host_cpus:
+            hnodes = format_cpulist(core.nodes_of_cpus(host_cpus, nodes))
+            parts.append(f"hôte non-passthrough->cpus {format_cpulist(host_cpus)} (nœud {hnodes})")
+        else:
+            parts.append("hôte non-passthrough : aucun cœur libre hors VM KVM")
+    if parts:
+        print("irq  " + " | ".join(parts))
 
 
 def show_plan(pairs: list[tuple[Guest, Placement]], state: st.State | None = None) -> None:
@@ -547,7 +634,8 @@ def show_plan(pairs: list[tuple[Guest, Placement]], state: st.State | None = Non
         mem = f"{g.mem_min_mb}-{g.mem_mb}" if g.elastic else str(g.mem_mb)
         used = st.usage(state, str(g.vmid)) if state is not None else None
         cpu = f"{used:>5.1f}" if used is not None else "    -"
-        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {cpu} pCPU {mem:>11} Mo  {where}  {p.reason}")
+        pinned = f" [cpus {format_cpulist(p.pinned_cpus)}]" if p.pinned_cpus else ""
+        print(f"{g.kind:<4} {g.vmid:>6}  {g.vcpus:>3} vCPU {cpu} pCPU {mem:>11} Mo  {where}  {p.reason}{pinned}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -582,12 +670,18 @@ def main(argv: list[str] | None = None) -> int:
     selected = [(g, p) for g, p in pairs if not args.vmids or g.vmid in args.vmids]
     if args.cmd == "plan":
         show_plan(selected, state)
+        show_pci_irq_plan(nodes, pairs)
         return 0
     if args.cmd == "status":
         for g, _ in selected:
             print(f"{g.kind:<4} {g.vmid:>6}  {actual_state(g)}")
         return 0
     ok = all([apply_one(p, g, args.live) for g, p in selected if p.nodes])
+    if args.live:
+        changed, skipped = apply_pci_irqs(nodes, pairs)
+        if changed or skipped:
+            extra = f" ({skipped} managées ignorées)" if skipped else ""
+            log(f"IRQ PCIe : {changed} mise(s) à jour{extra}")
     moves = {str(g.vmid): (before, p.node_ids) for g, p in selected if p.nodes
              for before in [current_nodes(g, nodes)] if before not in ((), p.node_ids)}
     boots = {str(g.vmid): boot_id(g) for g, _ in selected}

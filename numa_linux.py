@@ -5,10 +5,11 @@ Fonctionne sur x86 (EPYC, Xeon, Xeon Phi), ARM et POWER : les frères SMT vienne
 listes calculées par le noyau, pas d'hypothèses sur la numérotation. Compatible Python 3.6.
 """
 import glob
+import os
 import re
 import subprocess
 import sys
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numa_core as core
 
@@ -108,6 +109,132 @@ def shared_pci_ioh(sysfs: str = "/sys") -> bool:
             if cls and not cls.startswith("0x0600"):
                 io_roots.add(rb)
     return len(io_roots) == 1
+
+
+def pci_driver(addr: str, sysfs: str = "/sys") -> Optional[str]:
+    """Nom du pilote noyau lié à une carte PCI, ou None si aucun."""
+    try:
+        return os.path.basename(os.readlink("{}/bus/pci/devices/{}/driver".format(sysfs, addr)))
+    except OSError:
+        return None
+
+
+def pci_irqs(addr: str, sysfs: str = "/sys") -> Tuple[int, ...]:
+    """IRQ actives d'une carte PCI : MSI/MSI-X (msi_irqs/*), sinon IRQ classique (> 0)."""
+    dev = "{}/bus/pci/devices/{}".format(sysfs, addr)
+    msi_dir = dev + "/msi_irqs"
+    if os.path.isdir(msi_dir):
+        try:
+            irqs = sorted(int(name) for name in os.listdir(msi_dir) if name.isdigit())
+        except OSError:
+            irqs = []
+        if irqs:
+            return tuple(irqs)
+    raw = read(dev + "/irq")
+    if raw is not None:
+        try:
+            irq = int(raw.strip())
+            if irq > 0:
+                return (irq,)
+        except ValueError:
+            pass
+    return ()
+
+
+def host_pci_devices(sysfs: str = "/sys", exclude: Iterable[str] = ()) -> List[str]:
+    """Cartes PCI pilotées par l'hôte (hors vfio-pci et hors exclude) ayant au moins une IRQ."""
+    skip = set(exclude)
+    out = []  # type: List[str]
+    for path in sorted(glob.glob(sysfs + "/bus/pci/devices/*")):
+        addr = os.path.basename(path)
+        if addr in skip:
+            continue
+        drv = pci_driver(addr, sysfs)
+        if not drv or drv == "vfio-pci":
+            continue
+        if pci_irqs(addr, sysfs):
+            out.append(addr)
+    return out
+
+
+def plan_pci_irqs(nodes: Sequence[core.Node],
+                  pci_placements: Mapping[str, Tuple[int, ...]],
+                  shared_ioh: bool,
+                  sysfs: str = "/sys",
+                  host_irq_cpus: Optional[Tuple[int, ...]] = None) -> Dict[int, Tuple[int, ...]]:
+    """Calcule l'affinité cible (/proc/irq/<n>/smp_affinity_list) des IRQ PCIe.
+
+    - Chaque carte en passthrough (pci_placements[addr] = CPU exacts de sa VM) voit
+      ses IRQ VFIO dirigées vers les cœurs de SA VM (round-robin si multi-files MSI-X),
+      même avec plusieurs VM passthrough réparties sur différents sockets ou cœurs.
+    - Pour les cartes PCIe hôtes non-passthrough (qede, bnx2, ata_piix, ioatdma…) :
+      * si `host_irq_cpus` est fourni (issu de core.isolate_vm_cores), toutes leurs
+        IRQ vont EXCLUSIVEMENT sur ces cœurs dédiés (aucune VM KVM dessus) ;
+        si `host_irq_cpus == ()`, aucun cœur libre hors VM n'existe : on n'envoie
+        pas d'IRQ hôte sur un cœur de VM ;
+      * si `host_irq_cpus is None` et `shared_ioh=True`, repli sur les sockets sans
+        VM passthrough.
+    """
+    out = {}  # type: Dict[int, Tuple[int, ...]]
+
+    # 1) IRQ VFIO : chaque carte passthrough vers les cœurs exacts de sa VM
+    for addr, raw_cpus in sorted(pci_placements.items()):
+        cpus = tuple(sorted(set(raw_cpus)))
+        if not cpus:
+            continue
+        irqs = pci_irqs(addr, sysfs)
+        for i, irq in enumerate(irqs):
+            desired = (cpus[i % len(cpus)],) if len(irqs) > 1 else cpus
+            if irq in out:
+                out[irq] = tuple(sorted(set(out[irq]) | set(desired)))
+            else:
+                out[irq] = desired
+
+    # 2) IRQ PCIe hôtes non-passthrough : strictement hors cœurs VM KVM
+    target_host_cpus = ()  # type: Tuple[int, ...]
+    if host_irq_cpus is not None:
+        target_host_cpus = tuple(sorted(set(host_irq_cpus)))
+    elif shared_ioh and pci_placements:
+        pt_nodes = {nid for cpus in pci_placements.values()
+                    for nid in core.nodes_of_cpus(cpus, nodes)}
+        host_nodes = [n for n in nodes if n.id not in pt_nodes]
+        if host_nodes:
+            target_host_cpus = tuple(sorted(c for n in host_nodes for c in n.cpus))
+
+    if target_host_cpus:
+        for addr in host_pci_devices(sysfs, exclude=pci_placements.keys()):
+            irqs = pci_irqs(addr, sysfs)
+            for i, irq in enumerate(irqs):
+                if irq in out:  # ne jamais écraser une IRQ VFIO
+                    continue
+                out[irq] = (target_host_cpus[i % len(target_host_cpus)],) if len(irqs) > 1 else target_host_cpus
+    return out
+
+
+def apply_pci_irqs(irq_plan: Mapping[int, Tuple[int, ...]],
+                   proc: str = "/proc") -> Tuple[int, int]:
+    """Applique l'affinité d'IRQ planifiée (idempotent).
+
+    Rend (modifiées, ignorées_managées). Les IRQ gérées par le noyau (ex. files
+    NVMe blk-mq qui renvoient EIO) sont ignorées proprement sans faire échouer l'appel.
+    """
+    changed = 0
+    skipped = 0
+    for irq, cpus in sorted(irq_plan.items()):
+        path = "{}/irq/{}/smp_affinity_list".format(proc, irq)
+        cur = read(path)
+        if cur is None:
+            continue
+        wanted = tuple(sorted(set(cpus)))
+        if cur.strip() and core.parse_cpulist(cur) == wanted:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(core.format_cpulist(wanted) + "\n")
+            changed += 1
+        except OSError:
+            skipped += 1
+    return changed, skipped
 
 
 def node_meminfo(nid: int, sysfs: str = "/sys") -> Dict[str, int]:
