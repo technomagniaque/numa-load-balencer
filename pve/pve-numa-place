@@ -596,6 +596,12 @@ def apply_pci_irqs(nodes: list[Node],
                    pairs: list[tuple[Guest, Placement]]) -> tuple[int, int]:
     """Dirige les IRQ VFIO vers les cœurs exacts de leur VM et (sur IOH partagé)
     les IRQ PCIe hôtes non-passthrough vers les cœurs dédiés sans VM KVM."""
+    if linux.irqbalance_running(PROC):
+        # N1 (vérification Claude 2026-11-24) : irqbalance et ce démon se disputeraient les
+        # mêmes fichiers smp_affinity_list. On ne touche à rien et on le dit.
+        log("IRQ PCIe : irqbalance tourne, affinités d'IRQ NON appliquées "
+            "(arrêter irqbalance pour que pve-numa-place les gère)")
+        return 0, 0
     shared_ioh = linux.shared_pci_ioh(SYSFS)
     targets = pci_irq_targets(pairs, running_only=True)
     host_cpus = host_irq_cpus_for(nodes, pairs) if shared_ioh else None
@@ -625,6 +631,8 @@ def show_pci_irq_plan(nodes: list[Node], pairs: list[tuple[Guest, Placement]]) -
         else:
             parts.append("hôte non-passthrough : aucun cœur libre hors VM KVM")
     if parts:
+        if linux.irqbalance_running(PROC):
+            parts.append("ATTENTION : irqbalance tourne, ce plan ne sera PAS appliqué")
         print("irq  " + " | ".join(parts))
 
 

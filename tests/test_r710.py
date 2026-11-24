@@ -449,5 +449,33 @@ class PciIrqSplitTest(unittest.TestCase):
             self.assertEqual((root / "proc/irq/23/smp_affinity_list").read_text().strip(), "1,3")
 
 
+    def test_irqbalance_actif_aucune_affinite_ecrite(self):
+        """N1 : si irqbalance tourne, pve-numa-place ne touche à aucune IRQ (pas de bataille)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = FakeR710Host(root)
+            self._setup_r710_irqs(host)
+            host.vm(101, "sockets: 1\ncores: 4\nmemory: 30720\nnuma: 1\n"
+                         "hostpci0: 0000:06:00.6,pcie=1\nhostpci1: 0000:03:00.0,pcie=1\n")
+            write(root / "run/qemu-server/101.pid", "1001\n")
+            (root / "proc/1001").mkdir(parents=True)
+            write(root / "proc/777/comm", "irqbalance\n")
+            avant = (root / "proc/irq/114/smp_affinity_list").read_text()
+
+            self.assertTrue(linux.irqbalance_running(str(root / "proc")))
+            m = load_pve(dict(
+                PNP_SYSFS=str(root / "sys"), PNP_PROC=str(root / "proc"),
+                PNP_PVE_DIR=str(root / "pve"), PNP_RUN_DIR=str(root / "run"),
+                PNP_NODENAME="pve",
+            ))
+            nodes = m.read_topology()
+            pairs = m.build_plan(nodes, m.load_guests(), spread=True)
+            self.assertEqual(m.apply_pci_irqs(nodes, pairs), (0, 0))
+            self.assertEqual((root / "proc/irq/114/smp_affinity_list").read_text(), avant)
+
+            (root / "proc/777/comm").write_text("bash\n")
+            self.assertFalse(linux.irqbalance_running(str(root / "proc")))
+
+
 if __name__ == "__main__":
     unittest.main()
