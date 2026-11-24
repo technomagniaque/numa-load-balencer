@@ -151,6 +151,10 @@ pve-numa-place status
   Un pool libvirt `<forward mode='hostdev'><pf dev=…/>` ne les trouve donc pas : lister les VF
   par `<address type='pci' …/>` dans le pool (lu par `xen-numa-place`).
 - Passthrough et SR-IOV (Xen 4.17 à 4.21) : invité HVM ou PV seulement, pas PVH ; dom0 PV obligatoire.
+- Proxmox, IRQ PCIe (`--live`) : si **irqbalance** tourne, `pve-numa-place` n'écrit **aucune**
+  affinité d'IRQ (les deux se réécriraient en boucle) et le signale dans le journal et dans `plan`.
+  Pour qu'il gère les IRQ : `systemctl disable --now irqbalance`. Les IRQ gérées par le noyau
+  (files NVMe blk-mq, écriture refusée par EIO) sont ignorées et comptées à part.
 
 ## Tests
 

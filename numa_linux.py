@@ -211,6 +211,15 @@ def plan_pci_irqs(nodes: Sequence[core.Node],
     return out
 
 
+def irqbalance_running(proc: str = "/proc") -> bool:
+    """Vrai si un processus irqbalance tourne : il réécrirait en boucle les affinités d'IRQ
+    posées ici (et nous les siennes). Lecture de /proc/<pid>/comm, sans dépendre de systemd."""
+    for comm in glob.glob(proc + "/[0-9]*/comm"):
+        if (read(comm) or "").strip() == "irqbalance":
+            return True
+    return False
+
+
 def apply_pci_irqs(irq_plan: Mapping[int, Tuple[int, ...]],
                    proc: str = "/proc") -> Tuple[int, int]:
     """Applique l'affinité d'IRQ planifiée (idempotent).
